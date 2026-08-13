@@ -42,10 +42,13 @@ sys_install() {
     done
     systemctl disable --now nova-killswitch-monitor.service nova-killswitch-restore.service 2>/dev/null || true
 
-    # the system bus must reload to honour the new policy (passwordless wheel)
-    systemctl reload dbus 2>/dev/null || systemctl reload dbus-broker 2>/dev/null || true
+    # the system bus must reload to honour the new policy (passwordless wheel);
+    # ReloadConfig is the canonical trigger and works for dbus AND dbus-broker.
+    busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig 2>/dev/null \
+        || systemctl reload dbus-broker 2>/dev/null || systemctl reload dbus 2>/dev/null || true
     systemctl daemon-reload
     systemctl enable --now nova-killswitchd.service
+    systemctl restart nova-killswitchd.service 2>/dev/null || true
     say "daemon installed — control it from the GNOME toggle, the settings app,"
     say "or the terminal: nova-killswitch status | arm [chain] | disarm"
 }
@@ -59,7 +62,8 @@ sys_uninstall() {
     rm -f /usr/local/sbin/nova-killswitchd /usr/local/bin/nova-killswitch \
           /etc/dbus-1/system.d/org.novanetwork.KillSwitch.conf \
           /etc/systemd/system/nova-killswitchd.service
-    systemctl reload dbus 2>/dev/null || systemctl reload dbus-broker 2>/dev/null || true
+    busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig 2>/dev/null \
+        || systemctl reload dbus-broker 2>/dev/null || true
     systemctl daemon-reload
     say "kept: /etc/nova-killswitch (config + profiles) — remove manually if wanted"
 }
