@@ -44,6 +44,15 @@ AUTO_BYPASS_VPN_SUBNET=1    # auto-allow each active tunnel's own subnet
 TRUSTED_GATEWAYS=""         # "ip/mac ip/mac ..." — local VPN routers
 DNS_SERVERS=""              # dns mode: allowed resolver IPs (e.g. the nova-node
                             #           or the split tunnel's DNS, 10.8.0.1)
+MANAGE_TUNNELS=1            # arm = bring the profile's VPN chain up (ordered,
+                            #       with inter-layer routing); disarm = tear it
+                            #       down. 0 = firewall only, you manage tunnels.
+ALLOW_IN_PORTS="22"         # inbound TCP ports kept reachable while armed
+                            #   (sshd = 22) so you never lock yourself out
+MGMT_SUBNETS=""             # management subnets (e.g. your admin LAN) that must
+                            #   ALWAYS reach you: firewall-allowed AND routed via
+                            #   the main table (bypassing the VPN) so remote
+                            #   access survives even a full-tunnel chain
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 log() { logger -t nova-killswitch -- "$*" 2>/dev/null || true; echo "nova-killswitch: $*" >&2; }
@@ -153,6 +162,7 @@ gen_ruleset() {
         for i in $ifaces;    do [ -n "$i" ]  && echo "    oifname \"$i\" accept"; done
         for ep in $endpoints; do [ -n "$ep" ] && { is_ipv6 "$ep" && echo "    ip6 daddr $ep accept" || echo "    ip daddr $ep accept"; }; done
         for sn in $bypass;   do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept" || echo "    ip daddr $sn accept"; }; done
+        for sn in $MGMT_SUBNETS; do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept comment \"mgmt\"" || echo "    ip daddr $sn accept comment \"mgmt\""; }; done
         echo "    udp sport 68 udp dport 67 accept comment \"dhcp4\""
         echo "    udp sport 546 udp dport 547 accept comment \"dhcp6\""
         # trusted gateway = trust its whole uplink path (the router itself is
@@ -172,6 +182,10 @@ gen_ruleset() {
         echo "    ct state established,related accept"
         for i in $ifaces; do [ -n "$i" ] && echo "    iifname \"$i\" accept"; done
         [ -n "$trusted_iface" ] && echo "    iifname \"$trusted_iface\" accept comment \"trusted gateway uplink\""
+        # keep management reachable so arming can't lock you out of the box
+        local p
+        for p in $ALLOW_IN_PORTS; do [ -n "$p" ] && echo "    tcp dport $p accept comment \"mgmt port\""; done
+        for sn in $MGMT_SUBNETS; do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 saddr $sn accept comment \"mgmt\"" || echo "    ip saddr $sn accept comment \"mgmt\""; }; done
         echo "    udp sport 67 udp dport 68 accept comment \"dhcp4\""
         echo "    udp sport 547 udp dport 546 accept comment \"dhcp6\""
         echo "    icmp type { echo-reply, destination-unreachable, time-exceeded } accept"
@@ -254,6 +268,109 @@ gen_dns_ruleset() { # ifaces
     } > "$RUNTIME_RULESET"
 }
 
+# =====================  VPN chain orchestration  ============================
+# The manual "nmcli up A; nmcli up B" doesn't chain: B's handshake must travel
+# *inside* A, so B's endpoint has to be routed through A's interface before B
+# comes up. We do that here and tear it down cleanly on disarm.
+STATE_UP="$STATE_DIR/managed-conns"     # connections WE activated (teardown list)
+STATE_ROUTES="$STATE_DIR/added-routes"  # "endpoint dev iface" lines we added
+STATE_RULES="$STATE_DIR/added-rules"    # ip-rule specs we added (mgmt bypass)
+
+# static endpoint host/IPs of a connection, WITHOUT it being active
+static_endpoints() { # conn
+    local conn="$1" out
+    out="$(nmcli -t -f wireguard.peers connection show "$conn" 2>/dev/null || true)"
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out" | grep -oE 'endpoint=[^,[:space:]]+' | sed 's/endpoint=//' \
+            | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//'
+        return
+    fi
+    out="$(nmcli -t -f vpn.data connection show "$conn" 2>/dev/null || true)"
+    printf '%s\n' "$out" | grep -oE 'remote = [^,]+(, [^,]+)*' | sed 's/remote = //' \
+        | tr ',' '\n' | sed -E 's/^ *//; s/ *$//; s/\\$//; s/:[0-9]+.*$//' | grep -E '.'
+}
+
+nm_ipiface() { nmcli -t -f GENERAL.IP-IFACE connection show "$1" 2>/dev/null | cut -d: -f2; }
+conn_active() { nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx "$1"; }
+
+wait_iface() { # iface timeout
+    local i=0
+    while [ "$i" -lt "${2:-15}" ]; do iface_up "$1" && return 0; sleep 1; i=$((i+1)); done
+    return 1
+}
+
+# route a management subnet through the MAIN table (bypassing any VPN default
+# route) so remote access survives a full-tunnel chain. Higher priority than
+# the tunnel's rules.
+add_mgmt_bypass() {
+    local sn
+    : > "$STATE_RULES"
+    for sn in $MGMT_SUBNETS; do
+        [ -n "$sn" ] || continue
+        if ! ip rule show 2>/dev/null | grep -q "to $sn lookup main"; then
+            ip rule add to "$sn" lookup main priority 1000 2>/dev/null && echo "to $sn" >> "$STATE_RULES"
+            ip rule add from "$sn" lookup main priority 1000 2>/dev/null && echo "from $sn" >> "$STATE_RULES"
+        fi
+    done
+}
+del_mgmt_bypass() {
+    [ -f "$STATE_RULES" ] || return 0
+    local spec
+    while read -r spec; do [ -n "$spec" ] && ip rule del $spec lookup main priority 1000 2>/dev/null || true; done < "$STATE_RULES"
+    rm -f "$STATE_RULES"
+}
+
+chain_up() { # profile
+    local profile="$1" pf line conn prev_iface="" eps ep iface
+    pf="$(profile_file "$profile")"
+    : > "$STATE_UP"; : > "$STATE_ROUTES"
+    add_mgmt_bypass
+    [ -n "$profile" ] && [ -r "$pf" ] || return 0
+
+    while read -r line; do
+        line="${line%%#*}"; line="$(echo "$line" | xargs)"
+        [ -n "$line" ] || continue
+        conn="$line"
+
+        # pin this layer's endpoint(s) through the previous tunnel so its
+        # handshake nests inside the already-established layer
+        if [ -n "$prev_iface" ]; then
+            for ep in $(static_endpoints "$conn"); do
+                is_ipv6 "$ep" && continue    # v6 endpoints: skip pinning for now
+                if ip route replace "$ep" dev "$prev_iface" 2>/dev/null; then
+                    echo "$ep $prev_iface" >> "$STATE_ROUTES"
+                fi
+            done
+        fi
+
+        if conn_active "$conn"; then
+            log "layer $conn already up (not managing it)"
+        else
+            log "bringing up layer: $conn"
+            nmcli connection up "$conn" >/dev/null 2>&1 || { log "failed to bring up $conn"; break; }
+            echo "$conn" >> "$STATE_UP"
+        fi
+        iface="$(nm_ipiface "$conn")"
+        [ -n "$iface" ] && wait_iface "$iface" 15 || log "warning: $conn iface not up yet"
+        [ -n "$iface" ] && prev_iface="$iface"
+    done < "$pf"
+}
+
+chain_down() {
+    # bring down only what we started, in reverse; then remove our routes/rules
+    if [ -f "$STATE_UP" ]; then
+        tac "$STATE_UP" 2>/dev/null | while read -r conn; do
+            [ -n "$conn" ] && { log "bringing down layer: $conn"; nmcli connection down "$conn" >/dev/null 2>&1 || true; }
+        done
+        rm -f "$STATE_UP"
+    fi
+    if [ -f "$STATE_ROUTES" ]; then
+        while read -r ep dev; do [ -n "$ep" ] && ip route del "$ep" dev "$dev" 2>/dev/null || true; done < "$STATE_ROUTES"
+        rm -f "$STATE_ROUTES"
+    fi
+    del_mgmt_bypass
+}
+
 apply_now() { # profile
     local ev profile trusted trusted_iface ifaces endpoints bypass
     ev="$(evaluate "$1")"
@@ -276,12 +393,21 @@ armed() { [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE" 2>/dev/null)" = armed ]
 cmd_enable() {
     require_root; mkdir -p "$STATE_DIR"
     local profile="${1:-$DEFAULT_PROFILE}"
+    echo armed > "$STATE_FILE"          # mark armed first (monitor/sync active)
+    # 1) fail-close immediately — evaluate() already allows each layer's
+    #    endpoint even while its tunnel is down, so the chain can establish
+    #    without a leak window.
     apply_now "$profile"
-    echo armed > "$STATE_FILE"
+    # 2) bring the VPN chain up in order (with inter-layer endpoint routing)
+    if [ "$MANAGE_TUNNELS" = 1 ]; then chain_up "$profile"; fi
+    # 3) re-apply now that the tunnels' interfaces exist
+    apply_now "$profile"
     log "armed (profile=${profile:-none})"
 }
 cmd_disable() {
     require_root; mkdir -p "$STATE_DIR"
+    # tear the chain down while still fail-closed (no leak), then drop firewall
+    if [ "$MANAGE_TUNNELS" = 1 ]; then chain_down; fi
     nft delete table inet "$TABLE" 2>/dev/null || true
     echo disarmed > "$STATE_FILE"
     log "disarmed"
@@ -308,11 +434,24 @@ cmd_status() {
 }
 cmd_check() { require_root; evaluate "${1:-$DEFAULT_PROFILE}"; }
 
+# list VPN/WireGuard connections NM knows about, for the GUI chain builder:
+#   name<TAB>type<TAB>active(yes|no)
+cmd_list_vpns() {
+    local active; active="$(nmcli -t -f NAME connection show --active 2>/dev/null || true)"
+    nmcli -t -f NAME,TYPE connection show 2>/dev/null | while IFS=: read -r name type; do
+        case "$type" in
+            *wireguard*|*vpn*|*openvpn*)
+                if printf '%s\n' "$active" | grep -qx "$name"; then a=yes; else a=no; fi
+                printf '%s\t%s\t%s\n' "$name" "$type" "$a" ;;
+        esac
+    done
+}
+
 # --- config editing (called by the GTK app via pkexec) ----------------------
 # All writes go through root here so the GUI needs no direct access to /etc.
 # Keys are validated against a whitelist; values are stored verbatim but only
 # ever re-sourced as shell — so keep the allowed set boring (no code).
-CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS"
+CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS MANAGE_TUNNELS ALLOW_IN_PORTS MGMT_SUBNETS"
 
 valid_key() { case " $CONFIG_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -375,5 +514,7 @@ case "${1:-}" in
     profile-write)  shift; cmd_profile_write "${1:-}" ;;
     profile-delete) shift; cmd_profile_delete "${1:-}" ;;
     profile-list)   ls "$PROFILES_DIR" 2>/dev/null | sed 's/\.profile$//' ;;
-    *) echo "usage: nova-killswitch-ctl {enable [profile]|disable|sync|restore|status|check [profile]|config-get|config-set|profile-write|profile-delete|profile-list}" >&2; exit 2 ;;
+    profile-get)    shift; cat "$(profile_file "${1:-}")" 2>/dev/null || true ;;
+    list-vpns)      cmd_list_vpns ;;
+    *) echo "usage: nova-killswitch-ctl {enable [profile]|disable|sync|restore|status|check [profile]|config-get|config-set|profile-write|profile-delete|profile-list|profile-get|list-vpns}" >&2; exit 2 ;;
 esac

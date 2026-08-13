@@ -35,3 +35,18 @@ AUTO_BYPASS_VPN_SUBNET=1
 # the VPN chain may be skipped. Example:
 #   TRUSTED_GATEWAYS="192.168.1.1/aa:bb:cc:dd:ee:ff 10.0.0.1/11:22:33:44:55:66"
 TRUSTED_GATEWAYS=""
+
+# Arming a profile also brings its VPN chain up (in order, with inter-layer
+# routing) and disarming tears it back down. 0 = firewall only, you manage
+# the tunnels yourself.
+MANAGE_TUNNELS=1
+
+# Inbound TCP ports kept reachable while armed so you never lock yourself out
+# of the machine (sshd = 22). Space-separated.
+ALLOW_IN_PORTS="22"
+
+# Management subnets that must ALWAYS be able to reach this box — e.g. the
+# admin LAN you SSH in from. These are firewall-allowed AND policy-routed via
+# the main table, so remote access survives even a full-tunnel chain.
+#   MGMT_SUBNETS="192.168.2.0/24"
+MGMT_SUBNETS=""

@@ -30,6 +30,9 @@ sys_install() {
     install -Dm644 "$SRC/backend/systemd/nova-killswitch-monitor.service" /etc/systemd/system/nova-killswitch-monitor.service
     install -Dm755 "$SRC/backend/dispatcher/90-nova-killswitch" /etc/NetworkManager/dispatcher.d/90-nova-killswitch
     install -Dm644 "$SRC/backend/polkit/50-nova-killswitch.rules" /etc/polkit-1/rules.d/50-nova-killswitch.rules
+    # make polkit pick up the rule immediately (usually auto, but be sure so
+    # arm/disarm is passwordless right after install)
+    systemctl reload polkit 2>/dev/null || systemctl restart polkit 2>/dev/null || true
 
     install -dm755 /etc/nova-killswitch /etc/nova-killswitch/profiles
     [[ -f /etc/nova-killswitch/config ]] || install -Dm644 "$SRC/config.sample" /etc/nova-killswitch/config

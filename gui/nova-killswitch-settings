@@ -259,10 +259,31 @@ class Window(Adw.ApplicationWindow):
         self.toast(f"Deleted {name}" if rc == 0 else f"Failed: {err.strip()}")
         self.reload()
 
+    def _vpn_list(self):
+        """Available VPN/WG connections: [(name, type, active)]."""
+        rc, out, _ = ctl(["list-vpns"])
+        vpns = []
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) >= 2:
+                vpns.append((p[0], p[1], (len(p) > 2 and p[2] == "yes")))
+        return vpns
+
+    def _profile_layers(self, name):
+        if not name:
+            return []
+        rc, out, _ = ctl(["profile-get", name])
+        layers = []
+        for line in out.splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                layers.append(line)
+        return layers
+
     def _edit_profile(self, name):
         dlg = Adw.Window(title=("Edit " + name) if name else "New profile",
                          transient_for=self, modal=True)
-        dlg.set_default_size(460, 420)
+        dlg.set_default_size(500, 560)
         tb = Adw.ToolbarView()
         h = Adw.HeaderBar()
         name_entry = Gtk.Entry(placeholder_text="profile name", text=name or "",
@@ -274,23 +295,80 @@ class Window(Adw.ApplicationWindow):
         h.pack_end(save)
         tb.add_top_bar(h)
 
-        tv = Gtk.TextView(monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
-                          left_margin=10, right_margin=10, top_margin=8, bottom_margin=8)
-        body = ""
-        if name:
-            try:
-                with open(f"/etc/nova-killswitch/profiles/{name}.profile") as fh:
-                    body = fh.read()
-            except OSError:
-                body = ""
-        if not body:
-            body = ("# one VPN layer per line (NM connection name or interface)\n"
-                    "# layer order = chain order (top tunnels first)\n"
-                    "# example:\n"
-                    "#nova-master\n"
-                    "#nova-inner\n")
-        tv.get_buffer().set_text(body)
-        sc = Gtk.ScrolledWindow(child=tv, vexpand=True)
+        vpns = self._vpn_list()
+        existing = self._profile_layers(name)
+        vpn_types = {n: t for n, t, _ in vpns}
+        vpn_active = {n: a for n, _, a in vpns}
+        # order: existing layers first (in saved order), then the rest
+        ordered = [n for n in existing if n in vpn_types] + \
+                  [n for n, _, _ in vpns if n not in existing]
+        # include any profile layer whose connection no longer exists (keep it)
+        ordered += [n for n in existing if n not in vpn_types]
+
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        self._pe_rows = []
+
+        def renumber():
+            pos = 0
+            for r in self._pe_rows:
+                if r._check.get_active():
+                    pos += 1
+                    r.set_title(f"{pos}.  {r._conn}")
+                else:
+                    r.set_title(r._conn)
+
+        def move(row, delta):
+            i = self._pe_rows.index(row)
+            j = i + delta
+            if 0 <= j < len(self._pe_rows):
+                self._pe_rows[i], self._pe_rows[j] = self._pe_rows[j], self._pe_rows[i]
+                listbox.remove(row)
+                listbox.insert(row, j)
+                renumber()
+
+        for conn in ordered:
+            typ = vpn_types.get(conn, "missing")
+            row = Adw.ActionRow(title=conn)
+            row._conn = conn
+            sub = typ + ("  · active" if vpn_active.get(conn) else "")
+            row.set_subtitle(sub)
+            chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=(conn in existing))
+            chk.connect("toggled", lambda *_: renumber())
+            row._check = chk
+            row.add_prefix(chk)
+            up = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.CENTER)
+            up.add_css_class("flat")
+            up.connect("clicked", lambda _b, r=row: move(r, -1))
+            dn = Gtk.Button(icon_name="go-down-symbolic", valign=Gtk.Align.CENTER)
+            dn.add_css_class("flat")
+            dn.connect("clicked", lambda _b, r=row: move(r, +1))
+            row.add_suffix(up)
+            row.add_suffix(dn)
+            listbox.append(row)
+            self._pe_rows.append(row)
+        renumber()
+
+        hint = Gtk.Label(
+            label="Tick the tunnels in this chain and order them: layer 1 (top) "
+                  "is the base tunnel, each one below is routed through the one above.",
+            wrap=True, xalign=0, margin_top=6, margin_bottom=6)
+        hint.add_css_class("dim-label")
+        hint.add_css_class("caption")
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                      margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
+        box.append(hint)
+        if not vpns:
+            empty = Adw.StatusPage(icon_name="network-vpn-symbolic",
+                                   title="No VPN connections found",
+                                   description="Create WireGuard/OpenVPN connections in "
+                                               "GNOME Settings → Network first.")
+            box.append(empty)
+        else:
+            box.append(listbox)
+        sc = Gtk.ScrolledWindow(child=box, vexpand=True,
+                                hscrollbar_policy=Gtk.PolicyType.NEVER)
         tb.set_content(sc)
         dlg.set_content(tb)
 
@@ -299,8 +377,9 @@ class Window(Adw.ApplicationWindow):
             if not pname:
                 self.toast("Name required")
                 return
-            buf = tv.get_buffer()
-            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            layers = [r._conn for r in self._pe_rows if r._check.get_active()]
+            text = ("# nova-killswitch chain profile — layer order = chain order\n"
+                    + "\n".join(layers) + "\n")
             rc, _, err = ctl(["profile-write", pname], root=True, stdin=text)
             self.toast(f"Saved {pname}" if rc == 0 else f"Failed: {err.strip()}")
             dlg.close()
