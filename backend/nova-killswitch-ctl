@@ -104,8 +104,12 @@ resolve_layer() {
         iface="$spec"
         eps_raw="$(wg show "$spec" endpoints 2>/dev/null | awk '{print $2}')"
     # NetworkManager connection?
-    elif nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null | grep -q "^$spec:"; then
-        iface="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v n="$spec" '$1==n{print $2}')"
+    elif nmcli -t -f NAME,TYPE connection show --active 2>/dev/null | grep -q "^$spec:"; then
+        # Use the L3 IP interface (GENERAL.IP-IFACE), NOT DEVICE: for a VPN
+        # connection DEVICE is the underlying NIC (e.g. enp1s0) while the real
+        # tunnel is IP-IFACE (e.g. tun0). Allowing the base NIC would defeat
+        # the kill switch. For NM WireGuard, IP-IFACE is the wg iface itself.
+        iface="$(nmcli -t -f GENERAL.IP-IFACE connection show "$spec" 2>/dev/null | cut -d: -f2)"
         data="$(nmcli -t -f vpn.data connection show "$spec" 2>/dev/null || true)"
         eps_raw="$(printf '%s' "$data" | grep -oP '(?<=remote = )[^,]+' || true)"
         # wg-via-NM stores endpoint under wireguard.peers; fall back to wg show
