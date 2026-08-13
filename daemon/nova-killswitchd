@@ -14,10 +14,12 @@ base image. Runs as root under systemd.
 """
 import json
 import os
-import shlex
+import re
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 import gi
 gi.require_version("NM", "1.0") if False else None  # we use raw D-Bus, no NM lib
@@ -100,6 +102,15 @@ def log(msg):
 
 def is_ipv6(a):
     return ":" in a
+
+
+# an endpoint must look like an IP or hostname (has a dot or colon, only safe
+# chars) — anything else is parser garbage and must NEVER reach nft
+_EP_RE = re.compile(r"^[A-Za-z0-9._:\-]+$")
+
+
+def valid_endpoint(ep):
+    return bool(ep) and bool(_EP_RE.match(ep)) and ("." in ep or ":" in ep)
 
 
 # ---------------------------------------------------------------------------
@@ -188,10 +199,12 @@ class Net:
         elif Net.conn_active(spec):
             iface = Net.ip_iface(spec)
             data = run(["nmcli", "-t", "-f", "vpn.data", "connection", "show", spec]).stdout
-            import re
-            m = re.search(r"remote = ([^,]+(?:, [^,]+)*)", data)
+            # nmcli separates vpn.data keys with ", " and escapes commas INSIDE
+            # a value as "\,". The remote value therefore ends at the first
+            # unescaped ", " — match runs of (escaped-comma | non-comma).
+            m = re.search(r"remote = ((?:\\,|[^,])+)", data)
             if m:
-                for r0 in m.group(1).split(","):
+                for r0 in m.group(1).split("\\,"):
                     eps.append(r0.strip().split(":")[0])
             if not eps and iface and Net.iface_up(iface):
                 r = run(["wg", "show", iface, "endpoints"])
@@ -208,8 +221,10 @@ class Net:
         clean = []
         for e in eps:
             e = e.rsplit(":", 1)[0].strip("[]")
-            if e:
+            if valid_endpoint(e):
                 clean.append(e)
+            elif e:
+                log(f"dropping invalid endpoint token {e!r} for '{spec}'")
         return iface, clean
 
     @staticmethod
@@ -271,6 +286,9 @@ class Firewall:
         if final_iface:
             o.append(f'    oifname "{final_iface}" accept comment "final exit"')
         for carrier, ep in ep_rules:
+            if not valid_endpoint(ep):        # never let garbage reach nft
+                log(f"refusing invalid endpoint in ruleset: {ep!r}")
+                continue
             fam = "ip6" if is_ipv6(ep) else "ip"
             if carrier:
                 o.append(f'    oifname "{carrier}" {fam} daddr {ep} accept comment "nested endpoint"')
@@ -322,6 +340,8 @@ class KillSwitch:
         self.managed_conns = []      # connections WE brought up
         self.added_routes = []       # (dst, dev) route pins we added
         self.mgmt_routes = []        # mgmt subnet routes
+        self._lock = threading.Lock()  # serializes apply/chain work
+        self._worker = None
 
     # ---- helpers ----
     def _layers(self, profile):
@@ -391,11 +411,12 @@ class KillSwitch:
                 final_iface = prev
         else:
             final_iface = tdev
-        nft_apply(self.fw.full(final_iface, ep_rules, bypass))
+        ok = nft_apply(self.fw.full(final_iface, ep_rules, bypass))
         self._flush_conntrack()
         self.status.update(armed=True, mode="full", final_iface=final_iface,
                            node_path="", profile=profile,
-                           detail=(f"trusted gateway ({trusted.split('/')[0]})" if trusted
+                           detail=("firewall error — check journal" if not ok
+                                   else f"trusted gateway ({trusted.split('/')[0]})" if trusted
                                    else f"protected via {final_iface}" if final_iface
                                    else "blocking (chain not up)"))
         log(f"applied full: exit={final_iface or 'blocked'} trusted={trusted or 'no'}")
@@ -450,7 +471,7 @@ class KillSwitch:
                 ifc, _e = Net.resolve_layer(layer)
                 if ifc:
                     break
-                run(["sleep", "1"])
+                time.sleep(1)
             if ifc:
                 prev = ifc
 
@@ -463,30 +484,57 @@ class KillSwitch:
         self.added_routes = []
         self._del_mgmt_routes()
 
-    # ---- public ops ----
+    # ---- public ops (D-Bus handlers return immediately; slow work — tunnel
+    # bring-up/teardown — happens in a background worker thread) ------------
     def arm(self, profile=None, auto=False):
         profile = profile if profile is not None else self.cfg["default_profile"]
         self.cfg["armed"] = True
         self.cfg.save()
-        self.apply(profile)                              # fail-close first
+        with self._lock:
+            self.apply(profile)                          # fast: fail-close NOW
         if not auto and self.cfg["manage_tunnels"] and self.cfg["mode"] == "full":
+            self.status["detail"] = "connecting chain…"
+            self._spawn(self._arm_worker, profile)
+        self._notify()
+
+    def _arm_worker(self, profile):
+        with self._lock:
             self._chain_up(profile)
-            self.apply(profile)                          # re-apply with tunnels up
+            self.apply(profile)                          # re-apply, tunnels up
         self._notify()
 
     def disarm(self):
-        if self.cfg["manage_tunnels"]:
-            self._chain_down()
+        # drop the firewall immediately (tunnels still route while they're up),
+        # tear the chain down in the background
         nft_delete()
         self.cfg["armed"] = False
         self.cfg.save()
         self.status.update(armed=False, final_iface="", node_path="",
                            detail="disarmed")
+        if self.cfg["manage_tunnels"]:
+            self._spawn(self._disarm_worker)
         self._notify()
+
+    def _disarm_worker(self):
+        with self._lock:
+            self._chain_down()
+        self._notify()
+
+    def _spawn(self, fn, *args):
+        t = threading.Thread(target=self._guarded, args=(fn, *args), daemon=True)
+        self._worker = t
+        t.start()
+
+    def _guarded(self, fn, *args):
+        try:
+            fn(*args)
+        except Exception as e:  # noqa: BLE001
+            log(f"worker error: {e}")
 
     def sync(self):
         if self.cfg["armed"]:
-            self.apply(self.status.get("profile") or self.cfg["default_profile"])
+            with self._lock:
+                self.apply(self.status.get("profile") or self.cfg["default_profile"])
             self._notify()
 
     def auto_arm(self):
@@ -499,12 +547,14 @@ class KillSwitch:
 
     def restore(self):
         if self.cfg["armed"]:
-            self.apply(self.cfg["default_profile"])
+            with self._lock:
+                self.apply(self.cfg["default_profile"])
             log("restored armed state at startup")
 
     def _notify(self):
+        # may be called from worker threads — hop to the main loop
         if self.on_change:
-            self.on_change()
+            GLib.idle_add(self.on_change)
 
 
 # ---------------------------------------------------------------------------
