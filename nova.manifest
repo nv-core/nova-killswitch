@@ -1,7 +1,7 @@
 # nova.manifest — app metadata for the nova updater
 NAME=nova-killswitch
 DESCRIPTION=Fail-closed VPN kill switch: chaining, trusted gateways (IP+MAC), bypass subnets — GNOME extension + GTK app + root nftables backend
-VERSION=0.1.0
+VERSION=0.1.1
 TYPE=cli+gui
 SCOPE=both
 INSTALLER=install.sh

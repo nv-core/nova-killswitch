@@ -203,14 +203,17 @@ evaluate() {
             fi
         done < "$pf"
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$profile" "$trusted" "$trusted_iface" \
+    # '|' delimiter (non-whitespace) so `read` preserves empty fields — a tab
+    # would collapse empty/leading fields and shift everything. None of the
+    # values (IP/MAC, iface, profile, CIDRs, hostnames) ever contain '|'.
+    printf '%s|%s|%s|%s|%s|%s\n' "$profile" "$trusted" "$trusted_iface" \
         "$(echo "$ifaces" | xargs)" "$(echo "$endpoints" | xargs)" "$(echo "$bypass" | xargs)"
 }
 
 apply_now() { # profile
     local ev profile trusted trusted_iface ifaces endpoints bypass
     ev="$(evaluate "$1")"
-    IFS=$'\t' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
+    IFS='|' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
     gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
     nft -f "$RUNTIME_RULESET"
     mkdir -p "$STATE_DIR"
