@@ -44,9 +44,15 @@ nova-killswitch is a **dual-scope** app: installing it sets up the root
 backend (system scope) *and* the extension + settings app (user scope).
 
 ```bash
-nova install nova-killswitch          # user + system parts
-# system parts need the system scope set up once:
-#   nova-updater ./install.sh install --with-system
+nova install nova-killswitch          # installs both the user and system parts
+```
+
+The **system** (root firewall) part needs nova's system scope set up once —
+if you haven't already, run nova-updater's installer with `--with-system`:
+
+```bash
+# in the nova-updater checkout, one time:
+./install.sh install --with-system
 ```
 
 Then log out/in so GNOME loads the extension. Requires `nftables`,
