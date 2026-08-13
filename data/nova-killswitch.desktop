@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Nova Kill Switch
+Comment=VPN kill switch: chains, trusted gateways, bypass subnets
+Exec=nova-killswitch-settings
+Icon=network-vpn
+Terminal=false
+Categories=System;Security;Settings;
+Keywords=vpn;killswitch;firewall;wireguard;nftables;

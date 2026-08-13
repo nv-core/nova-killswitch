@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+#
+# nova-killswitch-ctl — fail-closed nftables VPN kill switch with VPN chaining,
+# trusted-gateway detection (IP+MAC) and a small bypass-subnet firewall.
+#
+# Runs as ROOT only (invoked via pkexec from the extension/GUI, from the
+# NetworkManager dispatcher, from the monitor service, or the boot-restore
+# unit). The GNOME extension and GTK app have NO privileges of their own.
+#
+# Design invariants (do not weaken):
+#   * default-deny on output AND input (policy drop), IPv6 included
+#   * ruleset is swapped atomically (single nft transaction)
+#   * armed state persists; boot-restore re-applies BEFORE NetworkManager,
+#     so a reboot never silently reverts to an unprotected state
+#   * when armed with no usable VPN and no trusted gateway -> block everything
+#
+# Subcommands:
+#   enable [profile]     arm; use PROFILE (default: config DEFAULT_PROFILE)
+#   disable              disarm: remove the table, normal routing
+#   sync                 re-evaluate (trusted gateway? which layers up?) and
+#                        re-apply if armed — called by dispatcher/monitor
+#   restore              boot-time re-apply of the last armed state
+#   status               print machine-readable state
+#   check                print evaluation (trusted gw, active layers) w/o applying
+#
+set -euo pipefail
+
+STATE_DIR=/etc/nova-killswitch
+CONFIG_FILE="$STATE_DIR/config"
+PROFILES_DIR="$STATE_DIR/profiles"
+STATE_FILE="$STATE_DIR/state"          # armed | disarmed
+CURRENT_FILE="$STATE_DIR/current"      # last applied evaluation (for restore)
+RUNTIME_RULESET=/run/nova-killswitch.nft
+TABLE=nova_ks
+
+# ---- defaults (overridable in $CONFIG_FILE) --------------------------------
+DEFAULT_PROFILE=""
+ALLOW_LAN=0                 # 1 = permit RFC1918/link-local while armed
+BYPASS_SUBNETS=""           # extra always-allowed CIDRs (space-separated)
+AUTO_BYPASS_VPN_SUBNET=1    # auto-allow each active tunnel's own subnet
+TRUSTED_GATEWAYS=""         # "ip/mac ip/mac ..." — local VPN routers
+[ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+log() { logger -t nova-killswitch -- "$*" 2>/dev/null || true; echo "nova-killswitch: $*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+require_root() { [ "$(id -u)" -eq 0 ] || die "must run as root (use pkexec)"; }
+is_ipv6() { case "$1" in *:*) return 0 ;; *) return 1 ;; esac; }
+
+# ---- gateway trust (IP + MAC) ----------------------------------------------
+# Returns 0 and echoes the matched "ip/mac" if the current default gateway is
+# in TRUSTED_GATEWAYS and its ARP MAC matches. Spoofing the IP alone is not
+# enough; an attacker must also forge the MAC on-link.
+default_gateways() { ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}'; }
+
+mac_of() { # ip -> lowercase mac or empty
+    ip neigh show "$1" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="lladdr") print tolower($(i+1))}' | head -1
+}
+
+gw_iface() { # gateway-ip -> the uplink interface whose default route uses it
+    ip -o route show default 2>/dev/null | awk -v g="$1" '{for(i=1;i<=NF;i++){if($i=="via")via=$(i+1); if($i=="dev")dev=$(i+1)} if(via==g) print dev}' | head -1
+}
+
+# Verify the current default gateway against TRUSTED_GATEWAYS by IP *and* MAC.
+# Echoes "entry|uplink-iface" on success. MAC binding defeats casual IP
+# spoofing (a hostile Wi-Fi handing out your router's IP); a determined
+# on-link attacker can still forge the MAC — accepted per the IP+MAC design.
+trusted_gateway() {
+    local gw want_ip want_mac have_mac entry
+    for gw in $(default_gateways); do
+        for entry in $TRUSTED_GATEWAYS; do
+            want_ip="${entry%%/*}"; want_mac="$(printf '%s' "${entry#*/}" | tr 'A-Z' 'a-z')"
+            [ "$gw" = "$want_ip" ] || continue
+            [ -n "$want_mac" ] || continue          # a MAC is mandatory for trust
+            ping -c1 -W1 "$gw" >/dev/null 2>&1 || true   # populate the neigh table
+            have_mac="$(mac_of "$gw")"
+            if [ "$have_mac" = "$want_mac" ]; then
+                echo "$entry|$(gw_iface "$gw")"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# ---- VPN layer detection ----------------------------------------------------
+# A profile is an ordered list of layers, one per line:
+#   <nm-connection-or-iface>   (layer 1 = base, layer 2 tunnels over layer 1…)
+# We report, for the active profile, the interfaces that are actually UP and
+# their endpoints, so the ruleset only trusts tunnels that truly exist.
+profile_file() { echo "$PROFILES_DIR/$1.profile"; }
+
+iface_up() { ip link show "$1" up >/dev/null 2>&1; }
+
+# resolve one layer spec to "iface|endpoint1 endpoint2"; empty iface if down
+resolve_layer() {
+    local spec="$1" iface="" eps="" data eps_raw r e
+    # native wireguard interface?
+    if command -v wg >/dev/null 2>&1 && wg show "$spec" >/dev/null 2>&1; then
+        iface="$spec"
+        eps_raw="$(wg show "$spec" endpoints 2>/dev/null | awk '{print $2}')"
+    # NetworkManager connection?
+    elif nmcli -t -f NAME,DEVICE,TYPE connection show --active 2>/dev/null | grep -q "^$spec:"; then
+        iface="$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | awk -F: -v n="$spec" '$1==n{print $2}')"
+        data="$(nmcli -t -f vpn.data connection show "$spec" 2>/dev/null || true)"
+        eps_raw="$(printf '%s' "$data" | grep -oP '(?<=remote = )[^,]+' || true)"
+        # wg-via-NM stores endpoint under wireguard.peers; fall back to wg show
+        [ -z "$eps_raw" ] && command -v wg >/dev/null 2>&1 && iface_up "$iface" && \
+            eps_raw="$(wg show "$iface" endpoints 2>/dev/null | awk '{print $2}')"
+    # plain interface name (wg-quick / systemd unit)?
+    elif [ -n "$spec" ] && iface_up "$spec"; then
+        iface="$spec"
+        command -v wg >/dev/null 2>&1 && wg show "$spec" >/dev/null 2>&1 && \
+            eps_raw="$(wg show "$spec" endpoints 2>/dev/null | awk '{print $2}')"
+    fi
+
+    [ -n "$iface" ] && ! iface_up "$iface" && iface=""   # spec matched but link down
+
+    for r in ${eps_raw:-}; do
+        e="${r%:*}"; e="${e#\[}"; e="${e%\]}"     # strip :port and [] on v6
+        [ -n "$e" ] && eps="$eps $e"
+    done
+    echo "$iface|$eps"
+}
+
+iface_subnets() { # iface -> its directly-connected CIDRs (v4+v6)
+    ip -o addr show dev "$1" 2>/dev/null | awk '{print $4}'
+}
+
+# ---- ruleset generation -----------------------------------------------------
+# Fail-closed. Accept: loopback, established, each UP VPN layer's iface, the
+# endpoints needed to (re)establish tunnels, DHCP, essential ICMP, configured
+# bypass subnets, and — only when a trusted gateway is verified — LAN to it.
+gen_ruleset() {
+    local ifaces="$1" endpoints="$2" bypass="$3" trusted_iface="$4"
+    {
+        echo "add table inet $TABLE"
+        echo "delete table inet $TABLE"
+        echo "table inet $TABLE {"
+        echo "  chain output {"
+        echo "    type filter hook output priority 0; policy drop;"
+        echo "    oifname \"lo\" accept"
+        echo "    ct state established,related accept"
+        local i ep sn
+        for i in $ifaces;    do [ -n "$i" ]  && echo "    oifname \"$i\" accept"; done
+        for ep in $endpoints; do [ -n "$ep" ] && { is_ipv6 "$ep" && echo "    ip6 daddr $ep accept" || echo "    ip daddr $ep accept"; }; done
+        for sn in $bypass;   do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept" || echo "    ip daddr $sn accept"; }; done
+        echo "    udp sport 68 udp dport 67 accept comment \"dhcp4\""
+        echo "    udp sport 546 udp dport 547 accept comment \"dhcp6\""
+        # trusted gateway = trust its whole uplink path (the router itself is
+        # the VPN). Allow the physical uplink interface, not just the gw IP —
+        # internet traffic routed through the gateway keeps its real dest IP.
+        if [ -n "$trusted_iface" ]; then
+            echo "    oifname \"$trusted_iface\" accept comment \"trusted gateway uplink\""
+        fi
+        if [ "$ALLOW_LAN" = "1" ]; then
+            echo "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment \"lan\""
+            echo "    ip6 daddr fe80::/10 accept comment \"link-local\""
+        fi
+        echo "  }"
+        echo "  chain input {"
+        echo "    type filter hook input priority 0; policy drop;"
+        echo "    iifname \"lo\" accept"
+        echo "    ct state established,related accept"
+        for i in $ifaces; do [ -n "$i" ] && echo "    iifname \"$i\" accept"; done
+        [ -n "$trusted_iface" ] && echo "    iifname \"$trusted_iface\" accept comment \"trusted gateway uplink\""
+        echo "    udp sport 67 udp dport 68 accept comment \"dhcp4\""
+        echo "    udp sport 547 udp dport 546 accept comment \"dhcp6\""
+        echo "    icmp type { echo-reply, destination-unreachable, time-exceeded } accept"
+        echo "    icmpv6 type { echo-reply, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, destination-unreachable, packet-too-big, time-exceeded } accept"
+        if [ "$ALLOW_LAN" = "1" ]; then
+            echo "    ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment \"lan\""
+        fi
+        echo "  }"
+        echo "}"
+    } > "$RUNTIME_RULESET"
+}
+
+# ---- evaluate: what should be allowed right now -----------------------------
+# echoes:  PROFILE\tTRUSTED_GW\tTRUSTED_IFACE\tIFACES\tENDPOINTS\tBYPASS
+evaluate() {
+    local profile="$1"
+    local trusted_raw="" trusted="" trusted_iface="" ifaces="" endpoints="" bypass="$BYPASS_SUBNETS"
+    local pf line res ifc eps
+
+    if trusted_raw="$(trusted_gateway)"; then
+        trusted="${trusted_raw%%|*}"; trusted_iface="${trusted_raw#*|}"
+    fi
+
+    pf="$(profile_file "$profile")"
+    if [ -n "$profile" ] && [ -r "$pf" ]; then
+        while read -r line; do
+            line="${line%%#*}"; line="$(echo "$line" | xargs)"
+            [ -n "$line" ] || continue
+            res="$(resolve_layer "$line")"
+            ifc="${res%%|*}"; eps="${res#*|}"
+            if [ -n "$ifc" ]; then
+                ifaces="$ifaces $ifc"; endpoints="$endpoints $eps"
+                [ "$AUTO_BYPASS_VPN_SUBNET" = "1" ] && bypass="$bypass $(iface_subnets "$ifc" | tr '\n' ' ')"
+            else
+                # a needed layer is down: still allow its endpoint so the tunnel
+                # can (re)establish, but don't trust the (absent) iface
+                endpoints="$endpoints $eps"
+            fi
+        done < "$pf"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$profile" "$trusted" "$trusted_iface" \
+        "$(echo "$ifaces" | xargs)" "$(echo "$endpoints" | xargs)" "$(echo "$bypass" | xargs)"
+}
+
+apply_now() { # profile
+    local ev profile trusted trusted_iface ifaces endpoints bypass
+    ev="$(evaluate "$1")"
+    IFS=$'\t' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
+    gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
+    nft -f "$RUNTIME_RULESET"
+    mkdir -p "$STATE_DIR"
+    { echo "PROFILE=$profile"; echo "TRUSTED=$trusted"; echo "TRUSTED_IFACE=$trusted_iface"
+      echo "IFACES=\"$ifaces\""; echo "ENDPOINTS=\"$endpoints\""
+      echo "BYPASS=\"$bypass\""; } > "$CURRENT_FILE"
+    log "applied (profile=${profile:-none} trusted_gw=${trusted:-no} ifaces=${ifaces:-none})"
+}
+
+armed() { [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE" 2>/dev/null)" = armed ]; }
+
+cmd_enable() {
+    require_root; mkdir -p "$STATE_DIR"
+    local profile="${1:-$DEFAULT_PROFILE}"
+    apply_now "$profile"
+    echo armed > "$STATE_FILE"
+    log "armed (profile=${profile:-none})"
+}
+cmd_disable() {
+    require_root; mkdir -p "$STATE_DIR"
+    nft delete table inet "$TABLE" 2>/dev/null || true
+    echo disarmed > "$STATE_FILE"
+    log "disarmed"
+}
+cmd_sync() {
+    require_root; armed || exit 0
+    local profile=""
+    [ -f "$CURRENT_FILE" ] && profile="$(sed -n 's/^PROFILE=//p' "$CURRENT_FILE")"
+    apply_now "${profile:-$DEFAULT_PROFILE}"
+}
+cmd_restore() {
+    require_root; armed || exit 0
+    local profile=""
+    [ -f "$CURRENT_FILE" ] && profile="$(sed -n 's/^PROFILE=//p' "$CURRENT_FILE")"
+    apply_now "${profile:-$DEFAULT_PROFILE}"
+    log "restored at boot (fail-closed until VPN/gateway available)"
+}
+cmd_status() {
+    local state=disarmed
+    armed && state=armed
+    echo "STATE=$state"
+    [ -f "$CURRENT_FILE" ] && cat "$CURRENT_FILE"
+    echo "TABLE_PRESENT=$(nft list table inet "$TABLE" >/dev/null 2>&1 && echo yes || echo no)"
+}
+cmd_check() { require_root; evaluate "${1:-$DEFAULT_PROFILE}"; }
+
+# --- config editing (called by the GTK app via pkexec) ----------------------
+# All writes go through root here so the GUI needs no direct access to /etc.
+# Keys are validated against a whitelist; values are stored verbatim but only
+# ever re-sourced as shell — so keep the allowed set boring (no code).
+CONFIG_KEYS="DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS"
+
+valid_key() { case " $CONFIG_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
+
+cmd_config_set() { # key value...
+    require_root; mkdir -p "$STATE_DIR"
+    local key="$1"; shift || true
+    local value="$*"
+    valid_key "$key" || die "unknown config key: $key"
+    # reject anything that could break out of KEY="value"
+    case "$value" in *\"*|*\$\(*|*\`*) die "illegal characters in value" ;; esac
+    touch "$CONFIG_FILE"
+    if grep -q "^$key=" "$CONFIG_FILE"; then
+        sed -i "s|^$key=.*|$key=\"$value\"|" "$CONFIG_FILE"
+    else
+        echo "$key=\"$value\"" >> "$CONFIG_FILE"
+    fi
+    log "config set $key"
+    armed && cmd_sync || true
+}
+
+cmd_config_get() { # [key]
+    [ -r "$CONFIG_FILE" ] || { echo "# no config yet"; return 0; }
+    if [ -n "${1:-}" ]; then
+        valid_key "$1" || die "unknown config key: $1"
+        sed -n "s|^$1=||p" "$CONFIG_FILE" | tail -1 | sed 's/^"\(.*\)"$/\1/'
+    else
+        grep -E "^($(echo "$CONFIG_KEYS" | tr ' ' '|'))=" "$CONFIG_FILE" 2>/dev/null || true
+    fi
+}
+
+cmd_profile_write() { # name  (profile body on stdin)
+    require_root; mkdir -p "$PROFILES_DIR"
+    local name="${1:-}"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad profile name"
+    cat > "$(profile_file "$name")"
+    log "profile written: $name"
+    armed && cmd_sync || true
+}
+
+cmd_profile_delete() {
+    require_root
+    local name="${1:-}"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "bad profile name"
+    rm -f "$(profile_file "$name")"
+    log "profile deleted: $name"
+}
+
+case "${1:-}" in
+    enable)  shift; cmd_enable "${1:-}" ;;
+    disable) cmd_disable ;;
+    sync)    cmd_sync ;;
+    restore) cmd_restore ;;
+    status)  cmd_status ;;
+    check)   shift; cmd_check "${1:-}" ;;
+    config-get)     shift; cmd_config_get "${1:-}" ;;
+    config-set)     shift; cmd_config_set "$@" ;;
+    profile-write)  shift; cmd_profile_write "${1:-}" ;;
+    profile-delete) shift; cmd_profile_delete "${1:-}" ;;
+    profile-list)   ls "$PROFILES_DIR" 2>/dev/null | sed 's/\.profile$//' ;;
+    *) echo "usage: nova-killswitch-ctl {enable [profile]|disable|sync|restore|status|check [profile]|config-get|config-set|profile-write|profile-delete|profile-list}" >&2; exit 2 ;;
+esac

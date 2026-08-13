@@ -1,0 +1,11 @@
+# Example VPN chain profile — copy to profiles/<name>.profile
+# One layer per line: a NetworkManager connection name, or a WireGuard /
+# wg-quick interface name. Order = chain order (first line = base tunnel,
+# each following line tunnels over the previous one).
+#
+# Single VPN:
+#   nova-master
+#
+# Chain (inner routed over outer):
+#   nova-master      # layer 1: reaches the internet
+#   nova-inner       # layer 2: runs inside layer 1

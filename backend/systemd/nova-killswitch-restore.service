@@ -1,0 +1,14 @@
+[Unit]
+Description=Restore Nova kill switch firewall (fail-closed, before network)
+DefaultDependencies=no
+Before=network-pre.target NetworkManager.service systemd-networkd.service
+Wants=network-pre.target
+After=local-fs.target nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nova-killswitch-ctl restore
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target

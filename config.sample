@@ -1,0 +1,22 @@
+# nova-killswitch config — installed to /etc/nova-killswitch/config
+# Sourced as shell by the root controller; edited via the GTK app (pkexec).
+
+# Profile armed by default (name of a file in profiles/, without .profile).
+# Empty = no VPN chain, only trusted-gateway/bypass rules apply.
+DEFAULT_PROFILE=""
+
+# Permit RFC1918 / link-local traffic while armed (1) or block it (0).
+ALLOW_LAN=0
+
+# Always-allowed destination CIDRs (space-separated, v4 and v6).
+BYPASS_SUBNETS=""
+
+# Auto-allow each active tunnel's own subnet (so in-VPN LAN works). 1/0.
+AUTO_BYPASS_VPN_SUBNET=1
+
+# Trusted local gateways = your nova-nodes / VPN routers. Space-separated
+# "IP/MAC" pairs. A gateway is trusted only when the current default route's
+# IP AND its ARP MAC both match — then its uplink interface is allowed and
+# the VPN chain may be skipped. Example:
+#   TRUSTED_GATEWAYS="192.168.1.1/aa:bb:cc:dd:ee:ff 10.0.0.1/11:22:33:44:55:66"
+TRUSTED_GATEWAYS=""

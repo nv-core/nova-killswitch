@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# NetworkManager dispatcher: re-sync the kill switch on any connectivity
+# change. Installed at /etc/NetworkManager/dispatcher.d/90-nova-killswitch.
+# NM calls it as: <script> <interface> <action>
+CTL=/usr/local/sbin/nova-killswitch-ctl
+STATE_FILE=/etc/nova-killswitch/state
+[ -x "$CTL" ] || exit 0
+[ "$(cat "$STATE_FILE" 2>/dev/null)" = armed ] || exit 0
+case "$2" in
+    up|down|vpn-up|vpn-down|connectivity-change|dhcp4-change|dhcp6-change)
+        "$CTL" sync ;;
+esac
+exit 0

@@ -1,0 +1,7 @@
+{
+    "uuid": "nova-killswitch@nv-core.net",
+    "name": "Nova Kill Switch",
+    "description": "Quick Settings toggle for the Nova fail-closed VPN kill switch: arm/disarm, pick a VPN chain profile, and see live status (protected / trusted gateway / blocking). UI only — all firewall enforcement lives in the root-owned nova-killswitch-ctl and is invoked via pkexec.",
+    "shell-version": ["45", "46", "47", "48", "49", "50"],
+    "url": "https://github.com/nv-core/nova-killswitch"
+}

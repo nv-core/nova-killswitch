@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""nova-killswitch-settings — GTK4/libadwaita settings for the Nova kill switch.
+
+The app has NO privileges: every read/write of /etc/nova-killswitch goes
+through `pkexec nova-killswitch-ctl {config-get,config-set,profile-*}`.
+"""
+import os
+import shutil
+import signal
+import subprocess
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib  # noqa: E402
+
+APP_ID = "org.novanetwork.NovaKillSwitch"
+
+
+def find_ctl():
+    for c in ("/usr/local/sbin/nova-killswitch-ctl",
+              "/etc/nova-killswitch/nova-killswitch-ctl",
+              shutil.which("nova-killswitch-ctl")):
+        if c and os.path.exists(c):
+            return c
+    return "/usr/local/sbin/nova-killswitch-ctl"
+
+
+CTL = find_ctl()
+
+
+def ctl(args, root=False, stdin=None):
+    argv = (["pkexec", CTL] if root else [CTL]) + args
+    try:
+        r = subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout, r.stderr
+    except Exception as e:  # noqa: BLE001
+        return 1, "", str(e)
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="Nova Kill Switch")
+        self.set_default_size(680, 760)
+        self._loading = False
+        self._arm_guard = False
+
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Nova Kill Switch",
+                                                subtitle="VPN kill switch settings"))
+        self.toasts = Adw.ToastOverlay()
+
+        page = Adw.PreferencesPage()
+        self._build_status(page)
+        self._build_general(page)
+        self._build_gateways(page)
+        self._build_profiles(page)
+
+        scroll = Gtk.ScrolledWindow(child=page, vexpand=True)
+        self.toasts.set_child(scroll)
+        view = Adw.ToolbarView(content=self.toasts)
+        view.add_top_bar(header)
+        self.set_content(view)
+
+        self.reload()
+
+    # ---- status group -------------------------------------------------------
+    def _build_status(self, page):
+        grp = Adw.PreferencesGroup(title="Status")
+        self.status_row = Adw.ActionRow(title="Kill switch", subtitle="…")
+        self.arm_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
+        self.arm_switch.connect("notify::active", self._on_arm)
+        self._arm_guard = False
+        self.status_row.add_suffix(self.arm_switch)
+        grp.add(self.status_row)
+        page.add(grp)
+
+    # ---- general group ------------------------------------------------------
+    def _build_general(self, page):
+        grp = Adw.PreferencesGroup(title="General",
+                                   description="Applied immediately; re-syncs if armed.")
+        self.default_profile = Adw.EntryRow(title="Default profile")
+        self.default_profile.connect("apply", lambda *_: self._save("DEFAULT_PROFILE",
+                                                                     self.default_profile.get_text()))
+        self.default_profile.set_show_apply_button(True)
+        grp.add(self.default_profile)
+
+        self.allow_lan = Adw.SwitchRow(title="Allow LAN while armed",
+                                       subtitle="Permit RFC1918 / link-local traffic")
+        self.allow_lan.connect("notify::active", lambda *_: self._loading or
+                               self._save("ALLOW_LAN", "1" if self.allow_lan.get_active() else "0"))
+        grp.add(self.allow_lan)
+
+        self.auto_bypass = Adw.SwitchRow(title="Auto-bypass VPN subnets",
+                                         subtitle="Allow each active tunnel's own subnet")
+        self.auto_bypass.connect("notify::active", lambda *_: self._loading or
+                                 self._save("AUTO_BYPASS_VPN_SUBNET",
+                                            "1" if self.auto_bypass.get_active() else "0"))
+        grp.add(self.auto_bypass)
+
+        self.bypass = Adw.EntryRow(title="Bypass subnets")
+        self.bypass.set_show_apply_button(True)
+        self.bypass.connect("apply", lambda *_: self._save("BYPASS_SUBNETS", self.bypass.get_text()))
+        grp.add(self.bypass)
+        page.add(grp)
+
+    # ---- trusted gateways ---------------------------------------------------
+    def _build_gateways(self, page):
+        grp = Adw.PreferencesGroup(
+            title="Trusted Gateways",
+            description="Local VPN routers. Format: IP/MAC space-separated. "
+                        "A gateway is trusted only if IP and MAC both match.")
+        self.gateways = Adw.EntryRow(title="IP/MAC list")
+        self.gateways.set_show_apply_button(True)
+        self.gateways.connect("apply", lambda *_: self._save("TRUSTED_GATEWAYS", self.gateways.get_text()))
+        grp.add(self.gateways)
+        detect = Gtk.Button(label="Add current gateway…", halign=Gtk.Align.START,
+                            margin_top=6)
+        detect.add_css_class("flat")
+        detect.connect("clicked", self._detect_gateway)
+        grp.add(detect)
+        page.add(grp)
+
+    # ---- profiles -----------------------------------------------------------
+    def _build_profiles(self, page):
+        grp = Adw.PreferencesGroup(
+            title="VPN Chain Profiles",
+            description="A profile is an ordered list of layers (one VPN "
+                        "connection/interface per line). Layer 2 tunnels over "
+                        "layer 1, and so on.")
+        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
+                         tooltip_text="New profile")
+        add.add_css_class("flat")
+        add.connect("clicked", lambda *_: self._edit_profile(None))
+        grp.set_header_suffix(add)
+        self.profiles_group = grp
+        page.add(grp)
+
+    # ---- data ---------------------------------------------------------------
+    def reload(self):
+        self._loading = True
+        # status (no root needed to read state files, but ctl status is simplest)
+        rc, out, _ = ctl(["status"])
+        armed = "STATE=armed" in out
+        self._arm_guard = True
+        self.arm_switch.set_active(armed)
+        self._arm_guard = False
+        prof = ""
+        trusted = ""
+        for line in out.splitlines():
+            if line.startswith("PROFILE="):
+                prof = line.split("=", 1)[1]
+            if line.startswith("TRUSTED="):
+                trusted = line.split("=", 1)[1]
+        if not armed:
+            self.status_row.set_subtitle("Disarmed")
+        elif trusted:
+            self.status_row.set_subtitle(f"Armed · trusted gateway ({trusted.split('/')[0]})")
+        else:
+            self.status_row.set_subtitle(f"Armed · profile “{prof or 'default'}”")
+
+        # config (readable without root)
+        cfg = {}
+        rc, out, _ = ctl(["config-get"])
+        for line in out.splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                cfg[k] = v.strip().strip('"')
+        self.default_profile.set_text(cfg.get("DEFAULT_PROFILE", ""))
+        self.allow_lan.set_active(cfg.get("ALLOW_LAN", "0") == "1")
+        self.auto_bypass.set_active(cfg.get("AUTO_BYPASS_VPN_SUBNET", "1") == "1")
+        self.bypass.set_text(cfg.get("BYPASS_SUBNETS", ""))
+        self.gateways.set_text(cfg.get("TRUSTED_GATEWAYS", ""))
+
+        self._reload_profiles()
+        self._loading = False
+
+    def _reload_profiles(self):
+        # clear old rows
+        for row in getattr(self, "_profile_rows", []):
+            self.profiles_group.remove(row)
+        self._profile_rows = []
+        rc, out, _ = ctl(["profile-list"])
+        for name in [n for n in out.split() if n]:
+            row = Adw.ActionRow(title=name)
+            edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
+            edit.add_css_class("flat")
+            edit.connect("clicked", lambda _b, n=name: self._edit_profile(n))
+            delete = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
+            delete.add_css_class("flat")
+            delete.add_css_class("error")
+            delete.connect("clicked", lambda _b, n=name: self._delete_profile(n))
+            row.add_suffix(edit)
+            row.add_suffix(delete)
+            self.profiles_group.add(row)
+            self._profile_rows.append(row)
+
+    # ---- actions ------------------------------------------------------------
+    def _save(self, key, value):
+        rc, _, err = ctl(["config-set", key, value], root=True)
+        self.toast("Saved" if rc == 0 else f"Failed: {err.strip() or rc}")
+        if rc == 0:
+            self.reload()
+
+    def _on_arm(self, *_):
+        if self._arm_guard:
+            return
+        want = self.arm_switch.get_active()
+        rc, _, err = ctl(["enable"] if want else ["disable"], root=True)
+        if rc != 0:
+            self.toast(f"Failed: {err.strip() or rc}")
+        self.reload()
+
+    def _detect_gateway(self, *_):
+        # find default gw + its MAC without privileges
+        try:
+            gw = subprocess.run(["ip", "-o", "route", "show", "default"],
+                                capture_output=True, text=True, timeout=5).stdout
+            parts = gw.split()
+            ip = parts[parts.index("via") + 1] if "via" in parts else ""
+            mac = ""
+            if ip:
+                subprocess.run(["ping", "-c1", "-W1", ip], capture_output=True, timeout=3)
+                ne = subprocess.run(["ip", "neigh", "show", ip],
+                                    capture_output=True, text=True, timeout=5).stdout
+                np = ne.split()
+                mac = np[np.index("lladdr") + 1] if "lladdr" in np else ""
+        except Exception:  # noqa: BLE001
+            ip = mac = ""
+        if not (ip and mac):
+            self.toast("Could not detect current gateway MAC")
+            return
+        entry = f"{ip}/{mac}"
+        cur = self.gateways.get_text().strip()
+        if entry in cur:
+            self.toast("Already listed")
+            return
+        self.gateways.set_text((cur + " " + entry).strip())
+        self._save("TRUSTED_GATEWAYS", self.gateways.get_text())
+
+    def _delete_profile(self, name):
+        rc, _, err = ctl(["profile-delete", name], root=True)
+        self.toast(f"Deleted {name}" if rc == 0 else f"Failed: {err.strip()}")
+        self.reload()
+
+    def _edit_profile(self, name):
+        dlg = Adw.Window(title=("Edit " + name) if name else "New profile",
+                         transient_for=self, modal=True)
+        dlg.set_default_size(460, 420)
+        tb = Adw.ToolbarView()
+        h = Adw.HeaderBar()
+        name_entry = Gtk.Entry(placeholder_text="profile name", text=name or "",
+                               sensitive=name is None, hexpand=True,
+                               valign=Gtk.Align.CENTER)
+        h.set_title_widget(name_entry)
+        save = Gtk.Button(label="Save")
+        save.add_css_class("suggested-action")
+        h.pack_end(save)
+        tb.add_top_bar(h)
+
+        tv = Gtk.TextView(monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR,
+                          left_margin=10, right_margin=10, top_margin=8, bottom_margin=8)
+        body = ""
+        if name:
+            try:
+                with open(f"/etc/nova-killswitch/profiles/{name}.profile") as fh:
+                    body = fh.read()
+            except OSError:
+                body = ""
+        if not body:
+            body = ("# one VPN layer per line (NM connection name or interface)\n"
+                    "# layer order = chain order (top tunnels first)\n"
+                    "# example:\n"
+                    "#nova-master\n"
+                    "#nova-inner\n")
+        tv.get_buffer().set_text(body)
+        sc = Gtk.ScrolledWindow(child=tv, vexpand=True)
+        tb.set_content(sc)
+        dlg.set_content(tb)
+
+        def do_save(*_):
+            pname = name_entry.get_text().strip()
+            if not pname:
+                self.toast("Name required")
+                return
+            buf = tv.get_buffer()
+            text = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True)
+            rc, _, err = ctl(["profile-write", pname], root=True, stdin=text)
+            self.toast(f"Saved {pname}" if rc == 0 else f"Failed: {err.strip()}")
+            dlg.close()
+            self.reload()
+
+        save.connect("clicked", do_save)
+        dlg.present()
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast.new(text))
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+
+    def do_activate(self):
+        win = self.get_active_window() or Window(self)
+        win.present()
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    raise SystemExit(App().run(None))
