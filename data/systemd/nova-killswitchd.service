@@ -1,0 +1,20 @@
+[Unit]
+Description=Nova kill switch / VPN firewall daemon
+Documentation=https://github.com/nv-core/nova-killswitch
+# start after the system bus (needed to own the name) but before the network
+# comes up, so a persisted armed state is restored fail-closed before any leak
+After=dbus.service nftables.service
+Wants=nftables.service
+Before=NetworkManager.service systemd-networkd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/nova-killswitchd
+Restart=on-failure
+RestartSec=3
+# hardening (needs net admin + nft + nmcli, so keep it light)
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

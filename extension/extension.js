@@ -1,5 +1,5 @@
-import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -7,51 +7,14 @@ import * as QuickSettings from 'resource:///org/gnome/shell/ui/quickSettings.js'
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const CTL_PATH = '/usr/local/sbin/nova-killswitch-ctl';
-const STATE_DIR = '/etc/nova-killswitch';
-const STATE_FILE = `${STATE_DIR}/state`;
-const CURRENT_FILE = `${STATE_DIR}/current`;
-const PROFILES_DIR = `${STATE_DIR}/profiles`;
+const DEST = 'org.novanetwork.KillSwitch';
+const OBJ = '/org/novanetwork/KillSwitch';
 
-function readTextFile(path) {
-    try {
-        const [ok, bytes] = GLib.file_get_contents(path);
-        return ok ? new TextDecoder().decode(bytes) : null;
-    } catch (e) {
-        return null;
-    }
-}
-
-function parseCurrent(text) {
-    const out = {mode: 'full', profile: '', trusted: '', ifaces: '', node_path: ''};
-    if (!text)
-        return out;
-    for (const line of text.split('\n')) {
-        const m = line.match(/^(MODE|PROFILE|TRUSTED|IFACES|NODE_PATH)=(.*)$/);
-        if (!m)
-            continue;
-        const key = m[1].toLowerCase();
-        out[key] = m[2].trim().replace(/^"(.*)"$/, '$1');
-    }
-    return out;
-}
-
-function listProfiles() {
-    const names = [];
-    try {
-        const dir = Gio.File.new_for_path(PROFILES_DIR);
-        const en = dir.enumerate_children('standard::name',
-            Gio.FileQueryInfoFlags.NONE, null);
-        let info;
-        while ((info = en.next_file(null)) !== null) {
-            const n = info.get_name();
-            if (n.endsWith('.profile'))
-                names.push(n.slice(0, -8));
-        }
-    } catch (e) {
-        // no profiles dir yet
-    }
-    return names.sort();
+// Talk to nova-killswitchd over the system bus. Passwordless via its bus policy.
+function callSync(method, params = null, replyType = null) {
+    const bus = Gio.DBus.system;
+    return bus.call_sync(DEST, OBJ, DEST, method, params, replyType,
+        Gio.DBusCallFlags.NONE, 5000, null);
 }
 
 const KillSwitchToggle = GObject.registerClass(
@@ -63,151 +26,127 @@ class KillSwitchToggle extends QuickSettings.QuickMenuToggle {
             toggleMode: true,
         });
 
-        this._syncing = false;
-        this._pending = false;
-        this._profile = '';   // '' = default profile from config
+        this._busy = false;
+        this._profile = '';
 
         this.menu.setHeader('network-vpn-symbolic', _('Nova Kill Switch'));
-        this._profileSection = new PopupMenu.PopupMenuSection();
-        this.menu.addMenuItem(this._profileSection);
+        this._profiles = new PopupMenu.PopupMenuSection();
+        this.menu.addMenuItem(this._profiles);
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const settingsItem = this.menu.addAction(_('Settings…'),
-            () => this._openSettings());
-        settingsItem.visible = true;
+        this.menu.addAction(_('Settings…'), () => this._openSettings());
 
         this.connect('clicked', () => this._onClicked());
         this.connect('destroy', () => this._onDestroy());
 
-        this._monitors = [];
-        for (const path of [STATE_FILE, CURRENT_FILE]) {
-            try {
-                const m = Gio.File.new_for_path(path)
-                    .monitor_file(Gio.FileMonitorFlags.NONE, null);
-                m.connect('changed', () => this._refresh());
-                this._monitors.push(m);
-            } catch (e) {
-                // file may not exist yet; refresh still polls
-            }
-        }
+        // live updates: the daemon emits Changed on every state change
+        this._sigId = Gio.DBus.system.signal_subscribe(
+            DEST, DEST, 'Changed', OBJ, null, Gio.DBusSignalFlags.NONE,
+            () => this._refresh());
 
-        this._buildProfileMenu();
+        this._buildProfiles();
         this._refresh();
     }
 
-    _buildProfileMenu() {
-        this._profileSection.removeAll();
-        const profiles = listProfiles();
-        if (profiles.length === 0)
-            return;
-        for (const name of profiles) {
+    _buildProfiles() {
+        this._profiles.removeAll();
+        let names = [];
+        try {
+            names = callSync('ListProfiles', null,
+                new GLib.VariantType('(as)')).deepUnpack()[0];
+        } catch (e) {
+            names = [];
+        }
+        for (const name of names) {
             const item = new PopupMenu.PopupMenuItem(name);
             item.connect('activate', () => {
                 this._profile = name;
                 if (this.checked)
-                    this._run(['enable', name]);   // re-arm with this profile
+                    this._arm(name);
                 this._refresh();
             });
-            this._profileSection.addMenuItem(item);
-            item._novaProfile = name;
+            item._name = name;
+            this._profiles.addMenuItem(item);
         }
     }
 
     _openSettings() {
         try {
-            Gio.Subprocess.new(['nova-killswitch-settings'],
-                Gio.SubprocessFlags.NONE);
+            Gio.Subprocess.new(['nova-killswitch-settings'], Gio.SubprocessFlags.NONE);
         } catch (e) {
-            Main.notify(_('Nova Kill Switch'),
-                _('Settings app not installed.'));
+            Main.notify(_('Nova Kill Switch'), _('Settings app not installed.'));
         }
     }
 
     _onClicked() {
-        if (this._syncing || this._pending)
+        if (this._busy)
             return;
-        const wantArmed = this.checked;
-        this._run(wantArmed ? ['enable', this._profile] : ['disable']);
+        if (this.checked)
+            this._arm(this._profile);
+        else
+            this._call('Disarm');
     }
 
-    _run(args) {
-        this._pending = true;
+    _arm(profile) {
+        this._call('Arm', new GLib.Variant('(s)', [profile || '']));
+    }
+
+    _call(method, params = null) {
+        this._busy = true;
         this.reactive = false;
-        const argv = ['pkexec', CTL_PATH, ...args.filter(a => a !== '')];
-        let proc;
         try {
-            proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE);
+            callSync(method, params, null);
         } catch (e) {
-            logError(e, 'nova-killswitch: failed to spawn pkexec');
-            this._pending = false;
-            this.reactive = true;
-            this._refresh();
-            return;
+            Main.notify(_('Nova Kill Switch'), e.message);
         }
-        proc.wait_check_async(null, (source, res) => {
-            try {
-                source.wait_check_finish(res);
-            } catch (e) {
-                logError(e, `nova-killswitch: ${args.join(' ')} failed`);
-            }
-            this._pending = false;
-            this.reactive = true;
-            this._refresh();
-        });
+        this._busy = false;
+        this.reactive = true;
+        this._refresh();
     }
 
     _refresh() {
-        const armed = (readTextFile(STATE_FILE) || '').trim() === 'armed';
-        const {mode, profile, trusted, ifaces} = parseCurrent(readTextFile(CURRENT_FILE));
+        let st = {};
+        try {
+            const r = callSync('GetStatus', null, new GLib.VariantType('(a{sv})'));
+            const dict = r.deepUnpack()[0];
+            for (const k in dict)
+                st[k] = dict[k].deepUnpack();
+        } catch (e) {
+            this.subtitle = _('daemon off');
+            this.iconName = 'changes-allow-symbolic';
+            return;
+        }
 
+        const armed = st.armed === true || st.armed === 'true';
         this._syncing = true;
         this.checked = armed;
         this._syncing = false;
 
-        // reflect the active profile in the submenu ornament
-        for (const item of this._profileSection._getMenuItems())
-            item.setOrnament(item._novaProfile === (this._profile || profile)
+        for (const item of this._profiles._getMenuItems())
+            item.setOrnament(item._name === (this._profile || st.profile)
                 ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
 
-        // padlock metaphor: open = off, closed = protected, warning = blocking
         if (!armed) {
             this.iconName = 'changes-allow-symbolic';
             this.subtitle = _('Off');
-        } else if (mode === 'node' || mode === 'dns') {
-            const path = parseCurrent(readTextFile(CURRENT_FILE)).node_path;
-            if (path === 'none') {
-                this.iconName = 'dialog-warning-symbolic';
-                this.subtitle = _('Node unreachable');
-            } else {
-                this.iconName = 'changes-prevent-symbolic';
-                this.subtitle = path === 'local' ? _('Node · local')
-                    : path === 'vpn' ? _('Node · VPN') : _('Node access');
-            }
-        } else if (trusted) {
-            this.iconName = 'changes-prevent-symbolic';
-            this.subtitle = _('Trusted gateway');
-        } else if (ifaces) {
-            this.iconName = 'changes-prevent-symbolic';
-            this.subtitle = _('Protected · %s').format(ifaces.split(' ').join('→'));
         } else {
-            this.iconName = 'dialog-warning-symbolic';
-            this.subtitle = _('Blocking — no VPN');
+            this.iconName = st.final_iface || st.node_path === 'local' || st.node_path === 'vpn'
+                ? 'changes-prevent-symbolic' : 'dialog-warning-symbolic';
+            this.subtitle = st.detail || _('Protected');
         }
     }
 
     _onDestroy() {
-        for (const m of this._monitors)
-            m.cancel();
-        this._monitors = [];
+        if (this._sigId)
+            Gio.DBus.system.signal_unsubscribe(this._sigId);
     }
 });
 
-const KillSwitchIndicator = GObject.registerClass(
-class KillSwitchIndicator extends QuickSettings.SystemIndicator {
+const Indicator = GObject.registerClass(
+class Indicator extends QuickSettings.SystemIndicator {
     _init() {
         super._init();
         this._indicator = this._addIndicator();
         this._indicator.icon_name = 'changes-allow-symbolic';
-
         this._toggle = new KillSwitchToggle();
         this._toggle.bind_property('checked', this._indicator, 'visible',
             GObject.BindingFlags.SYNC_CREATE);
@@ -219,10 +158,9 @@ class KillSwitchIndicator extends QuickSettings.SystemIndicator {
 
 export default class NovaKillSwitchExtension extends Extension {
     enable() {
-        this._indicator = new KillSwitchIndicator();
+        this._indicator = new Indicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
     }
-
     disable() {
         this._indicator.quickSettingsItems.forEach(i => i.destroy());
         this._indicator.destroy();

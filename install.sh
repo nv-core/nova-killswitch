@@ -21,40 +21,45 @@ want_gui() {
 }
 say() { printf ':: %s\n' "$*"; }
 
-# ---------------- system scope (root) ---------------------------------------
+# ---------------- system scope (root): the daemon ---------------------------
 sys_install() {
-    say "installing kill switch backend (root)"
-    install -Dm755 "$SRC/backend/nova-killswitch-ctl"     /usr/local/sbin/nova-killswitch-ctl
-    install -Dm755 "$SRC/backend/nova-killswitch-monitor" /usr/local/sbin/nova-killswitch-monitor
-    install -Dm644 "$SRC/backend/systemd/nova-killswitch-restore.service" /etc/systemd/system/nova-killswitch-restore.service
-    install -Dm644 "$SRC/backend/systemd/nova-killswitch-monitor.service" /etc/systemd/system/nova-killswitch-monitor.service
-    install -Dm755 "$SRC/backend/dispatcher/90-nova-killswitch" /etc/NetworkManager/dispatcher.d/90-nova-killswitch
-    install -Dm644 "$SRC/backend/polkit/50-nova-killswitch.rules" /etc/polkit-1/rules.d/50-nova-killswitch.rules
-    # make polkit pick up the rule immediately (usually auto, but be sure so
-    # arm/disarm is passwordless right after install)
-    systemctl reload polkit 2>/dev/null || systemctl restart polkit 2>/dev/null || true
+    say "installing nova-killswitchd (root daemon) + D-Bus service"
+    install -Dm755 "$SRC/daemon/nova-killswitchd" /usr/local/sbin/nova-killswitchd
+    install -Dm755 "$SRC/bin/nova-killswitch"     /usr/local/bin/nova-killswitch
+    install -Dm644 "$SRC/data/dbus/org.novanetwork.KillSwitch.conf" \
+        /etc/dbus-1/system.d/org.novanetwork.KillSwitch.conf
+    install -Dm644 "$SRC/data/systemd/nova-killswitchd.service" \
+        /etc/systemd/system/nova-killswitchd.service
+    install -dm755 /etc/nova-killswitch
 
-    install -dm755 /etc/nova-killswitch /etc/nova-killswitch/profiles
-    [[ -f /etc/nova-killswitch/config ]] || install -Dm644 "$SRC/config.sample" /etc/nova-killswitch/config
+    # migrate an old bash install out of the way, if present
+    for f in /usr/local/sbin/nova-killswitch-ctl /usr/local/sbin/nova-killswitch-monitor \
+             /etc/systemd/system/nova-killswitch-restore.service \
+             /etc/systemd/system/nova-killswitch-monitor.service \
+             /etc/NetworkManager/dispatcher.d/90-nova-killswitch \
+             /etc/polkit-1/rules.d/50-nova-killswitch.rules; do
+        [[ -e $f ]] && rm -f "$f"
+    done
+    systemctl disable --now nova-killswitch-monitor.service nova-killswitch-restore.service 2>/dev/null || true
 
+    # the system bus must reload to honour the new policy (passwordless wheel)
+    systemctl reload dbus 2>/dev/null || systemctl reload dbus-broker 2>/dev/null || true
     systemctl daemon-reload
-    systemctl enable --now nova-killswitch-restore.service
-    systemctl enable --now nova-killswitch-monitor.service
-    say "backend installed — arm from the GNOME toggle or: pkexec nova-killswitch-ctl enable"
+    systemctl enable --now nova-killswitchd.service
+    say "daemon installed — control it from the GNOME toggle, the settings app,"
+    say "or the terminal: nova-killswitch status | arm [chain] | disarm"
 }
 
-sys_update() { sys_install; }
+sys_update() { sys_install; systemctl restart nova-killswitchd.service 2>/dev/null || true; }
 
 sys_uninstall() {
-    say "disarming + removing kill switch backend"
-    /usr/local/sbin/nova-killswitch-ctl disable 2>/dev/null || true
-    systemctl disable --now nova-killswitch-monitor.service 2>/dev/null || true
-    systemctl disable --now nova-killswitch-restore.service 2>/dev/null || true
-    rm -f /usr/local/sbin/nova-killswitch-ctl /usr/local/sbin/nova-killswitch-monitor \
-          /etc/systemd/system/nova-killswitch-restore.service \
-          /etc/systemd/system/nova-killswitch-monitor.service \
-          /etc/NetworkManager/dispatcher.d/90-nova-killswitch \
-          /etc/polkit-1/rules.d/50-nova-killswitch.rules
+    say "stopping + removing the kill switch daemon"
+    nova-killswitch disarm 2>/dev/null || true
+    systemctl disable --now nova-killswitchd.service 2>/dev/null || true
+    rm -f /usr/local/sbin/nova-killswitchd /usr/local/bin/nova-killswitch \
+          /etc/dbus-1/system.d/org.novanetwork.KillSwitch.conf \
+          /etc/systemd/system/nova-killswitchd.service
+    systemctl reload dbus 2>/dev/null || systemctl reload dbus-broker 2>/dev/null || true
     systemctl daemon-reload
     say "kept: /etc/nova-killswitch (config + profiles) — remove manually if wanted"
 }

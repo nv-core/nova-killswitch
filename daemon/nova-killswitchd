@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""nova-killswitchd — dynamic VPN kill switch / firewall manager (root daemon).
+
+A single stateful process that:
+  * owns the nftables kill switch (hardened, fail-closed)
+  * watches NetworkManager over D-Bus and reacts to VPN up/down/drops in real
+    time (no dispatcher scripts, no polling)
+  * exposes a D-Bus system interface (org.novanetwork.KillSwitch) for the GTK
+    app and the GNOME extension — passwordless for the `wheel` group via the
+    D-Bus bus policy, so no pkexec/polkit prompts
+
+Only PyGObject (GLib/Gio) + nft + ip/nmcli are used — all in the Silverblue
+base image. Runs as root under systemd.
+"""
+import json
+import os
+import shlex
+import signal
+import subprocess
+import sys
+
+import gi
+gi.require_version("NM", "1.0") if False else None  # we use raw D-Bus, no NM lib
+from gi.repository import GLib, Gio  # noqa: E402
+
+BUS_NAME = "org.novanetwork.KillSwitch"
+OBJ_PATH = "/org/novanetwork/KillSwitch"
+IFACE = "org.novanetwork.KillSwitch"
+
+STATE_DIR = "/etc/nova-killswitch"
+CONFIG_JSON = os.path.join(STATE_DIR, "config.json")
+TABLE = "nova_ks"
+RUNTIME_RULESET = "/run/nova-killswitch.nft"
+
+DEFAULTS = {
+    "mode": "full",                 # full | node
+    "armed": False,                 # persisted so we can restore on boot
+    "default_profile": "",
+    "manage_tunnels": True,
+    "auto_arm": False,
+    "auto_bypass_vpn_subnet": True,
+    "bypass_subnets": "",
+    "trusted_gateways": "",         # "ip/mac ..."
+    "allow_in_ports": "22",
+    "mgmt_subnets": "",
+    "node_local": "",
+    "node_vpn": "",
+    "node_tunnel": "",
+    "profiles": {},                 # name -> [layer, ...]
+}
+
+INTROSPECTION = f"""
+<node>
+  <interface name="{IFACE}">
+    <method name="Arm"><arg type="s" name="profile" direction="in"/></method>
+    <method name="Disarm"/>
+    <method name="GetStatus"><arg type="a{{sv}}" name="status" direction="out"/></method>
+    <method name="GetConfig"><arg type="a{{ss}}" name="config" direction="out"/></method>
+    <method name="SetConfig">
+      <arg type="s" name="key" direction="in"/>
+      <arg type="s" name="value" direction="in"/>
+    </method>
+    <method name="ListVpns"><arg type="a(sss)" name="vpns" direction="out"/></method>
+    <method name="ListProfiles"><arg type="as" name="names" direction="out"/></method>
+    <method name="GetProfile">
+      <arg type="s" name="name" direction="in"/>
+      <arg type="as" name="layers" direction="out"/>
+    </method>
+    <method name="WriteProfile">
+      <arg type="s" name="name" direction="in"/>
+      <arg type="as" name="layers" direction="in"/>
+    </method>
+    <method name="DeleteProfile"><arg type="s" name="name" direction="in"/></method>
+    <signal name="Changed"/>
+  </interface>
+</node>
+"""
+
+# ---------------------------------------------------------------------------
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def nft_apply(ruleset):
+    with open(RUNTIME_RULESET, "w") as fh:
+        fh.write(ruleset)
+    r = run(["nft", "-f", RUNTIME_RULESET])
+    if r.returncode != 0:
+        log(f"nft error: {r.stderr.strip()}")
+    return r.returncode == 0
+
+
+def nft_delete():
+    run(["nft", "delete", "table", "inet", TABLE])
+
+
+def log(msg):
+    print(f"nova-killswitchd: {msg}", file=sys.stderr, flush=True)
+
+
+def is_ipv6(a):
+    return ":" in a
+
+
+# ---------------------------------------------------------------------------
+class Config:
+    def __init__(self):
+        self.data = dict(DEFAULTS)
+        self.data["profiles"] = {}
+        self.load()
+
+    def load(self):
+        try:
+            with open(CONFIG_JSON) as fh:
+                loaded = json.load(fh)
+            for k, v in loaded.items():
+                self.data[k] = v
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = CONFIG_JSON + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(self.data, fh, indent=2)
+        os.replace(tmp, CONFIG_JSON)
+
+    def __getitem__(self, k):
+        return self.data.get(k, DEFAULTS.get(k))
+
+    def __setitem__(self, k, v):
+        self.data[k] = v
+
+
+# ---------------------------------------------------------------------------
+class Net:
+    """Thin NetworkManager / ip / wg helpers via nmcli + ip (base image)."""
+
+    @staticmethod
+    def active_vpns():
+        r = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"])
+        out = []
+        for line in r.stdout.splitlines():
+            name, _, typ = line.partition(":")
+            if any(t in typ for t in ("wireguard", "vpn", "openvpn")):
+                out.append(name)
+        return out
+
+    @staticmethod
+    def all_vpns():
+        r = run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+        active = set(Net.active_vpns())
+        out = []
+        for line in r.stdout.splitlines():
+            name, _, typ = line.partition(":")
+            if any(t in typ for t in ("wireguard", "vpn", "openvpn")):
+                out.append((name, typ, "yes" if name in active else "no"))
+        return out
+
+    @staticmethod
+    def iface_up(ifc):
+        return run(["ip", "link", "show", ifc, "up"]).returncode == 0
+
+    @staticmethod
+    def ip_iface(conn):
+        r = run(["nmcli", "-t", "-f", "GENERAL.IP-IFACE", "connection", "show", conn])
+        return r.stdout.partition(":")[2].strip()
+
+    @staticmethod
+    def conn_active(conn):
+        return conn in Net.active_vpns()
+
+    @staticmethod
+    def iface_subnets(ifc):
+        r = run(["ip", "-o", "addr", "show", "dev", ifc])
+        return [ln.split()[3] for ln in r.stdout.splitlines() if len(ln.split()) > 3]
+
+    @staticmethod
+    def resolve_layer(spec):
+        """(iface, [endpoints]) for a VPN connection/iface. iface only if it's a
+        REAL tunnel (never the physical NIC — that would defeat the switch)."""
+        iface, eps = "", []
+        # native wireguard iface?
+        if run(["wg", "show", spec]).returncode == 0:
+            iface = spec
+            r = run(["wg", "show", spec, "endpoints"])
+            eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
+        elif Net.conn_active(spec):
+            iface = Net.ip_iface(spec)
+            data = run(["nmcli", "-t", "-f", "vpn.data", "connection", "show", spec]).stdout
+            import re
+            m = re.search(r"remote = ([^,]+(?:, [^,]+)*)", data)
+            if m:
+                for r0 in m.group(1).split(","):
+                    eps.append(r0.strip().split(":")[0])
+            if not eps and iface and Net.iface_up(iface):
+                r = run(["wg", "show", iface, "endpoints"])
+                eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
+        elif spec and Net.iface_up(spec):
+            iface = spec
+
+        if iface and not Net.iface_up(iface):
+            iface = ""
+        # SECURITY: reject a physical NIC masquerading as the tunnel
+        if iface and not (iface.startswith(("tun", "tap", "wg", "ppp", "nova")) or iface == spec):
+            log(f"ignoring non-tunnel iface '{iface}' for '{spec}'")
+            iface = ""
+        clean = []
+        for e in eps:
+            e = e.rsplit(":", 1)[0].strip("[]")
+            if e:
+                clean.append(e)
+        return iface, clean
+
+    @staticmethod
+    def default_gw():
+        r = run(["ip", "-o", "route", "show", "default"])
+        gw = dev = ""
+        for tok in r.stdout.split():
+            pass
+        parts = r.stdout.split()
+        if "via" in parts:
+            gw = parts[parts.index("via") + 1]
+        if "dev" in parts:
+            dev = parts[parts.index("dev") + 1]
+        return gw, dev
+
+    @staticmethod
+    def mac_of(ip):
+        run(["ping", "-c1", "-W1", ip])
+        r = run(["ip", "neigh", "show", ip])
+        p = r.stdout.split()
+        return p[p.index("lladdr") + 1].lower() if "lladdr" in p else ""
+
+    @staticmethod
+    def reachable(addr):
+        return run(["ping", "-c1", "-W1", addr.split("/")[0]]).returncode == 0
+
+
+# ---------------------------------------------------------------------------
+class Firewall:
+    """Builds and applies the hardened nftables ruleset (ported from the proven
+    bash design). General traffic exits ONLY the final hop; each tunnel's
+    endpoint is pinned to its carrier interface, so a chain that doesn't nest is
+    dropped (fail-closed), never leaked."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    def _mgmt_out(self):
+        out = []
+        for sn in self.cfg["mgmt_subnets"].split():
+            fam = "ip6" if is_ipv6(sn) else "ip"
+            out.append(f'    {fam} daddr {sn} accept comment "mgmt"')
+        return out
+
+    def _mgmt_in(self):
+        out = []
+        for p in self.cfg["allow_in_ports"].split():
+            out.append(f'    tcp dport {p} accept comment "mgmt port"')
+        for sn in self.cfg["mgmt_subnets"].split():
+            fam = "ip6" if is_ipv6(sn) else "ip"
+            out.append(f'    {fam} saddr {sn} accept comment "mgmt"')
+        return out
+
+    def full(self, final_iface, ep_rules, bypass):
+        """ep_rules: list of (carrier, endpoint). carrier '' = base/LAN (layer1)."""
+        o = ["table inet %s {" % TABLE, "  chain output {",
+             "    type filter hook output priority 0; policy drop;",
+             '    oifname "lo" accept', "    ct state established,related accept"]
+        if final_iface:
+            o.append(f'    oifname "{final_iface}" accept comment "final exit"')
+        for carrier, ep in ep_rules:
+            fam = "ip6" if is_ipv6(ep) else "ip"
+            if carrier:
+                o.append(f'    oifname "{carrier}" {fam} daddr {ep} accept comment "nested endpoint"')
+            else:
+                o.append(f'    {fam} daddr {ep} accept comment "layer1 endpoint"')
+        for sn in bypass.split():
+            fam = "ip6" if is_ipv6(sn) else "ip"
+            o.append(f'    {fam} daddr {sn} accept comment "bypass"')
+        o += self._mgmt_out()
+        o += ['    udp sport 68 udp dport 67 accept comment "dhcp4"',
+              '    udp sport 546 udp dport 547 accept comment "dhcp6"', "  }",
+              "  chain input {",
+              "    type filter hook input priority 0; policy drop;",
+              '    iifname "lo" accept', "    ct state established,related accept"]
+        if final_iface:
+            o.append(f'    iifname "{final_iface}" accept comment "final exit"')
+        o += self._mgmt_in()
+        o += ['    udp sport 67 udp dport 68 accept comment "dhcp4"',
+              '    udp sport 547 udp dport 546 accept comment "dhcp6"',
+              "    icmp type { echo-reply, destination-unreachable, time-exceeded } accept",
+              "    icmpv6 type { echo-reply, nd-neighbor-solicit, nd-neighbor-advert, "
+              "nd-router-advert, destination-unreachable, packet-too-big, time-exceeded } accept",
+              "  }", "}"]
+        return f"add table inet {TABLE}\ndelete table inet {TABLE}\n" + "\n".join(o) + "\n"
+
+    def node(self, addr, ifc):
+        o = ["table inet %s {" % TABLE, "  chain output {",
+             "    type filter hook output priority 0; policy accept;",
+             '    oifname "lo" accept']
+        if addr:
+            fam = "ip6" if is_ipv6(addr) else "ip"
+            o.append(f'    {fam} daddr {addr} accept comment "nova-node"')
+            if ifc:
+                o.append(f'    oifname "{ifc}" accept comment "node tunnel"')
+        o += ['    udp dport 53 drop comment "force DNS to nova-node"',
+              '    tcp dport { 53, 853 } drop comment "force DNS to nova-node"',
+              "  }", "}"]
+        return f"add table inet {TABLE}\ndelete table inet {TABLE}\n" + "\n".join(o) + "\n"
+
+
+# ---------------------------------------------------------------------------
+class KillSwitch:
+    def __init__(self, cfg, on_change):
+        self.cfg = cfg
+        self.fw = Firewall(cfg)
+        self.on_change = on_change
+        self.status = {"armed": False, "mode": cfg["mode"], "final_iface": "",
+                       "node_path": "", "profile": "", "detail": "disarmed"}
+        self.managed_conns = []      # connections WE brought up
+        self.added_routes = []       # (dst, dev) route pins we added
+        self.mgmt_routes = []        # mgmt subnet routes
+
+    # ---- helpers ----
+    def _layers(self, profile):
+        if profile and profile in self.cfg["profiles"]:
+            return list(self.cfg["profiles"][profile])
+        return Net.active_vpns()     # auto: protect whatever is up
+
+    def _trusted_gw(self):
+        want = self.cfg["trusted_gateways"].split()
+        gw, dev = Net.default_gw()
+        if not gw:
+            return "", ""
+        for entry in want:
+            ip, _, mac = entry.partition("/")
+            if gw == ip and mac and Net.mac_of(gw) == mac.lower():
+                return entry, dev
+        return "", ""
+
+    def _flush_conntrack(self):
+        if run(["sh", "-c", "command -v conntrack"]).returncode == 0:
+            run(["conntrack", "-F"])
+
+    # ---- mgmt bypass routing (survives full tunnel) ----
+    def _add_mgmt_routes(self):
+        self.mgmt_routes = []
+        subs = self.cfg["mgmt_subnets"].split()
+        if not subs:
+            return
+        gw, dev = Net.default_gw()
+        if not (gw and dev):
+            return
+        for sn in subs:
+            if run(["ip", "route", "replace", sn, "via", gw, "dev", dev]).returncode == 0:
+                self.mgmt_routes.append(sn)
+
+    def _del_mgmt_routes(self):
+        for sn in self.mgmt_routes:
+            run(["ip", "route", "del", sn])
+        self.mgmt_routes = []
+
+    # ---- apply firewall for the current state ----
+    def apply(self, profile):
+        if self.cfg["mode"] in ("node", "dns"):
+            return self._apply_node()
+        return self._apply_full(profile)
+
+    def _apply_full(self, profile):
+        trusted, tdev = self._trusted_gw()
+        final_iface, ep_rules, bypass = "", [], self.cfg["bypass_subnets"]
+        if not trusted:
+            prev, all_up, n = "", True, 0
+            for layer in self._layers(profile):
+                n += 1
+                ifc, eps = Net.resolve_layer(layer)
+                carrier = "" if n == 1 else prev
+                if n == 1 or carrier:
+                    for ep in eps:
+                        ep_rules.append((carrier, ep))
+                if ifc:
+                    prev = ifc
+                    if self.cfg["auto_bypass_vpn_subnet"]:
+                        bypass += " " + " ".join(Net.iface_subnets(ifc))
+                else:
+                    all_up = False
+                    prev = ""
+            if all_up and n > 0:
+                final_iface = prev
+        else:
+            final_iface = tdev
+        nft_apply(self.fw.full(final_iface, ep_rules, bypass))
+        self._flush_conntrack()
+        self.status.update(armed=True, mode="full", final_iface=final_iface,
+                           node_path="", profile=profile,
+                           detail=(f"trusted gateway ({trusted.split('/')[0]})" if trusted
+                                   else f"protected via {final_iface}" if final_iface
+                                   else "blocking (chain not up)"))
+        log(f"applied full: exit={final_iface or 'blocked'} trusted={trusted or 'no'}")
+
+    def _apply_node(self):
+        kind, addr, ifc = self._node_pick()
+        nft_apply(self.fw.node(addr, ifc))
+        self.status.update(armed=True, mode="node", final_iface=ifc,
+                           node_path=kind, profile="",
+                           detail={"local": "node via LAN", "vpn": "node via VPN",
+                                   "none": "node unreachable (DNS blocked)"}[kind])
+        log(f"applied node: path={kind} addr={addr or 'none'}")
+
+    def _node_pick(self):
+        nl, nv, nt = self.cfg["node_local"], self.cfg["node_vpn"], self.cfg["node_tunnel"]
+        if nl and Net.reachable(nl):
+            if nt and Net.conn_active(nt) and nt in self.managed_conns:
+                run(["nmcli", "connection", "down", nt])
+                self.managed_conns.remove(nt)
+            return "local", nl, ""
+        if nt:
+            if not Net.conn_active(nt):
+                run(["nmcli", "connection", "up", nt])
+                if nt not in self.managed_conns:
+                    self.managed_conns.append(nt)
+            ifc, _ = Net.resolve_layer(nt)
+            if nv and (Net.reachable(nv) or ifc):
+                return "vpn", nv, ifc
+        return "none", "", ""
+
+    # ---- chain orchestration (bring tunnels up in order) ----
+    def _chain_up(self, profile):
+        self.added_routes = []
+        self._add_mgmt_routes()
+        prev = ""
+        for layer in self.cfg["profiles"].get(profile, []):
+            if prev:
+                ifc0, eps = Net.resolve_layer(layer)  # static-ish; endpoints
+                for ep in eps:
+                    if not is_ipv6(ep):
+                        if run(["ip", "route", "replace", ep, "dev", prev]).returncode == 0:
+                            self.added_routes.append((ep, prev))
+            if not Net.conn_active(layer):
+                if run(["nmcli", "connection", "up", layer]).returncode == 0:
+                    self.managed_conns.append(layer)
+                else:
+                    log(f"failed to bring up {layer}")
+                    break
+            # wait for real tunnel iface
+            ifc = ""
+            for _ in range(20):
+                ifc, _e = Net.resolve_layer(layer)
+                if ifc:
+                    break
+                run(["sleep", "1"])
+            if ifc:
+                prev = ifc
+
+    def _chain_down(self):
+        for conn in reversed(self.managed_conns):
+            run(["nmcli", "connection", "down", conn])
+        self.managed_conns = []
+        for dst, dev in self.added_routes:
+            run(["ip", "route", "del", dst, "dev", dev])
+        self.added_routes = []
+        self._del_mgmt_routes()
+
+    # ---- public ops ----
+    def arm(self, profile=None, auto=False):
+        profile = profile if profile is not None else self.cfg["default_profile"]
+        self.cfg["armed"] = True
+        self.cfg.save()
+        self.apply(profile)                              # fail-close first
+        if not auto and self.cfg["manage_tunnels"] and self.cfg["mode"] == "full":
+            self._chain_up(profile)
+            self.apply(profile)                          # re-apply with tunnels up
+        self._notify()
+
+    def disarm(self):
+        if self.cfg["manage_tunnels"]:
+            self._chain_down()
+        nft_delete()
+        self.cfg["armed"] = False
+        self.cfg.save()
+        self.status.update(armed=False, final_iface="", node_path="",
+                           detail="disarmed")
+        self._notify()
+
+    def sync(self):
+        if self.cfg["armed"]:
+            self.apply(self.status.get("profile") or self.cfg["default_profile"])
+            self._notify()
+
+    def auto_arm(self):
+        if not self.cfg["auto_arm"]:
+            return
+        if self.cfg["armed"]:
+            self.sync()
+        else:
+            self.arm(auto=True)
+
+    def restore(self):
+        if self.cfg["armed"]:
+            self.apply(self.cfg["default_profile"])
+            log("restored armed state at startup")
+
+    def _notify(self):
+        if self.on_change:
+            self.on_change()
+
+
+# ---------------------------------------------------------------------------
+class NMMonitor:
+    """React to NetworkManager state changes in real time (debounced)."""
+
+    def __init__(self, bus, on_event):
+        self.on_event = on_event
+        self._pending = 0
+        # StateChanged fires for the NM manager AND for each active connection
+        bus.signal_subscribe("org.freedesktop.NetworkManager", None, "StateChanged",
+                             None, None, Gio.DBusSignalFlags.NONE, self._changed)
+        bus.signal_subscribe("org.freedesktop.NetworkManager", None, "DeviceAdded",
+                             None, None, Gio.DBusSignalFlags.NONE, self._changed)
+        bus.signal_subscribe("org.freedesktop.NetworkManager", None, "DeviceRemoved",
+                             None, None, Gio.DBusSignalFlags.NONE, self._changed)
+
+    def _changed(self, *_):
+        # debounce bursts: act ~1.2s after the last event
+        if self._pending:
+            GLib.source_remove(self._pending)
+        self._pending = GLib.timeout_add(1200, self._fire)
+
+    def _fire(self):
+        self._pending = 0
+        try:
+            self.on_event()
+        except Exception as e:  # noqa: BLE001
+            log(f"event handler error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+class Service:
+    CONFIG_KEYS = {"mode", "default_profile", "manage_tunnels", "auto_arm",
+                   "auto_bypass_vpn_subnet", "bypass_subnets", "trusted_gateways",
+                   "allow_in_ports", "mgmt_subnets", "node_local", "node_vpn",
+                   "node_tunnel"}
+    BOOL_KEYS = {"manage_tunnels", "auto_arm", "auto_bypass_vpn_subnet"}
+
+    def __init__(self):
+        self.cfg = Config()
+        self.ks = KillSwitch(self.cfg, self._emit_changed)
+        self.conn = None
+        self.reg_id = 0
+
+    # ---- lifecycle ----
+    def start(self):
+        self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.node_info = Gio.DBusNodeInfo.new_for_xml(INTROSPECTION)
+        Gio.bus_own_name_on_connection(self.bus, BUS_NAME,
+                                       Gio.BusNameOwnerFlags.NONE,
+                                       self._on_acquired, None)
+        self.monitor = NMMonitor(self.bus, self._on_nm_event)
+        self.ks.restore()
+
+    def _on_acquired(self, conn, name):
+        self.conn = conn
+        self.reg_id = conn.register_object(OBJ_PATH, self.node_info.interfaces[0],
+                                           self._handle, None, None)
+        log(f"owning {name} on the system bus")
+
+    def _on_nm_event(self):
+        if self.cfg["auto_arm"] and Net.active_vpns():
+            self.ks.auto_arm()
+        elif self.cfg["armed"]:
+            self.ks.sync()
+
+    def _emit_changed(self):
+        if self.conn:
+            self.conn.emit_signal(None, OBJ_PATH, IFACE, "Changed", None)
+
+    # ---- D-Bus method dispatch ----
+    # Signature of the method-call closure varies across PyGObject versions
+    # (with/without trailing user_data), so accept *args and pick fields by
+    # type — the method name is the sole str after the object path, and the
+    # invocation + parameters are found by class.
+    def _handle(self, *args):
+        invocation = next(a for a in args if isinstance(a, Gio.DBusMethodInvocation))
+        params = next((a for a in args if isinstance(a, GLib.Variant)), None)
+        method = invocation.get_method_name()
+        try:
+            ret = self._dispatch(method, params)
+            invocation.return_value(ret)
+        except Exception as e:  # noqa: BLE001
+            log(f"{method} failed: {e}")
+            invocation.return_dbus_error(f"{IFACE}.Error", str(e))
+
+    def _dispatch(self, method, params):
+        if method == "Arm":
+            self.ks.arm(params.unpack()[0] or None)
+            return None
+        if method == "Disarm":
+            self.ks.disarm()
+            return None
+        if method == "GetStatus":
+            s = dict(self.ks.status)
+            var = {k: GLib.Variant("s", str(v)) if not isinstance(v, bool)
+                   else GLib.Variant("b", v) for k, v in s.items()}
+            return GLib.Variant("(a{sv})", (var,))
+        if method == "GetConfig":
+            d = {k: self._str(self.cfg[k]) for k in self.CONFIG_KEYS}
+            return GLib.Variant("(a{ss})", (d,))
+        if method == "SetConfig":
+            key, val = params.unpack()
+            if key not in self.CONFIG_KEYS:
+                raise ValueError(f"unknown key {key}")
+            self.cfg[key] = (val in ("1", "true", "True")) if key in self.BOOL_KEYS else val
+            self.cfg.save()
+            if self.cfg["armed"]:
+                self.ks.sync()
+            self._emit_changed()
+            return None
+        if method == "ListVpns":
+            return GLib.Variant("(a(sss))", (Net.all_vpns(),))
+        if method == "ListProfiles":
+            return GLib.Variant("(as)", (sorted(self.cfg["profiles"].keys()),))
+        if method == "GetProfile":
+            name = params.unpack()[0]
+            return GLib.Variant("(as)", (self.cfg["profiles"].get(name, []),))
+        if method == "WriteProfile":
+            name, layers = params.unpack()
+            self.cfg["profiles"][name] = list(layers)
+            self.cfg.save()
+            self._emit_changed()
+            return None
+        if method == "DeleteProfile":
+            self.cfg["profiles"].pop(params.unpack()[0], None)
+            self.cfg.save()
+            self._emit_changed()
+            return None
+        raise ValueError(f"unknown method {method}")
+
+    @staticmethod
+    def _str(v):
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        return str(v)
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    if os.geteuid() != 0:
+        log("must run as root")
+        return 1
+    os.makedirs(STATE_DIR, exist_ok=True)
+    svc = Service()
+    svc.start()
+    GLib.MainLoop().run()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
