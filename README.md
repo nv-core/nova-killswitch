@@ -4,9 +4,12 @@ A fail-closed VPN kill switch for the **Nova Network**, built for GNOME on
 Fedora Silverblue / Bluefin. Combines the correct root-firewall architecture
 of a proper kill switch with intelligent, leak-proof automation:
 
-- **Fail-closed nftables** — `policy drop` on input *and* output, IPv6
-  included, swapped atomically. Armed = nothing leaves except through an
-  allowed path. If the VPN drops, or you reboot, or you switch Wi-Fi→5G,
+- **Two modes** — **Full** (fail-closed WAN kill switch: `policy drop` on
+  input *and* output, IPv6 included, swapped atomically — nothing leaves
+  except through an allowed path) and **DNS-only** (WAN stays open, but DNS
+  and DoT are forced through the trusted resolver / split tunnel and blocked
+  everywhere else — a lightweight "use the nova-node only as DNS" mode).
+  In full mode, if the VPN drops, you reboot, or you switch Wi-Fi→5G,
   traffic stays blocked until a permitted path is back.
 - **VPN chaining** — named *profiles* of ordered layers (`tun0`, then `tun1`
   routed over `tun0`, …). Each layer may be a NetworkManager connection, a

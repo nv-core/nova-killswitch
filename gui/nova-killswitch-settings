@@ -79,6 +79,20 @@ class Window(Adw.ApplicationWindow):
     def _build_general(self, page):
         grp = Adw.PreferencesGroup(title="General",
                                    description="Applied immediately; re-syncs if armed.")
+
+        self.mode = Adw.ComboRow(title="Protection mode",
+                                 subtitle="Full = block all WAN except VPN; "
+                                          "DNS = keep WAN, force DNS through the tunnel")
+        self.mode.set_model(Gtk.StringList.new(["Full kill switch", "DNS only"]))
+        self.mode.connect("notify::selected", lambda *_: self._loading or
+                          self._save("MODE", "dns" if self.mode.get_selected() == 1 else "full"))
+        grp.add(self.mode)
+
+        self.dns_servers = Adw.EntryRow(title="DNS resolvers (DNS mode)")
+        self.dns_servers.set_show_apply_button(True)
+        self.dns_servers.connect("apply", lambda *_: self._save("DNS_SERVERS", self.dns_servers.get_text()))
+        grp.add(self.dns_servers)
+
         self.default_profile = Adw.EntryRow(title="Default profile")
         self.default_profile.connect("apply", lambda *_: self._save("DEFAULT_PROFILE",
                                                                      self.default_profile.get_text()))
@@ -166,6 +180,8 @@ class Window(Adw.ApplicationWindow):
             if "=" in line and not line.startswith("#"):
                 k, v = line.split("=", 1)
                 cfg[k] = v.strip().strip('"')
+        self.mode.set_selected(1 if cfg.get("MODE", "full") == "dns" else 0)
+        self.dns_servers.set_text(cfg.get("DNS_SERVERS", ""))
         self.default_profile.set_text(cfg.get("DEFAULT_PROFILE", ""))
         self.allow_lan.set_active(cfg.get("ALLOW_LAN", "0") == "1")
         self.auto_bypass.set_active(cfg.get("AUTO_BYPASS_VPN_SUBNET", "1") == "1")

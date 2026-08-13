@@ -34,11 +34,16 @@ RUNTIME_RULESET=/run/nova-killswitch.nft
 TABLE=nova_ks
 
 # ---- defaults (overridable in $CONFIG_FILE) --------------------------------
+MODE=full                   # full = fail-closed WAN killswitch
+                            # dns  = WAN stays open, only DNS is forced through
+                            #        the trusted resolver/tunnel (anti-leak)
 DEFAULT_PROFILE=""
-ALLOW_LAN=0                 # 1 = permit RFC1918/link-local while armed
+ALLOW_LAN=0                 # 1 = permit RFC1918/link-local while armed (full mode)
 BYPASS_SUBNETS=""           # extra always-allowed CIDRs (space-separated)
 AUTO_BYPASS_VPN_SUBNET=1    # auto-allow each active tunnel's own subnet
 TRUSTED_GATEWAYS=""         # "ip/mac ip/mac ..." — local VPN routers
+DNS_SERVERS=""              # dns mode: allowed resolver IPs (e.g. the nova-node
+                            #           or the split tunnel's DNS, 10.8.0.1)
 [ -r "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 
 log() { logger -t nova-killswitch -- "$*" 2>/dev/null || true; echo "nova-killswitch: $*" >&2; }
@@ -210,17 +215,56 @@ evaluate() {
         "$(echo "$ifaces" | xargs)" "$(echo "$endpoints" | xargs)" "$(echo "$bypass" | xargs)"
 }
 
+# DNS-leak-prevention ruleset: WAN stays open (policy accept), but plain DNS
+# (udp/tcp 53) and DoT (tcp 853) are only allowed to the trusted resolvers or
+# out an active VPN/split tunnel — every other DNS query is dropped. (DoH over
+# 443 can't be distinguished from HTTPS, so it isn't blocked here.)
+gen_dns_ruleset() { # ifaces
+    local ifaces="$1" s i
+    {
+        echo "add table inet $TABLE"
+        echo "delete table inet $TABLE"
+        echo "table inet $TABLE {"
+        echo "  chain output {"
+        echo "    type filter hook output priority 0; policy accept;"
+        echo "    oifname \"lo\" accept"
+        for s in $DNS_SERVERS; do
+            [ -n "$s" ] || continue
+            if is_ipv6 "$s"; then
+                echo "    ip6 daddr $s udp dport 53 accept"
+                echo "    ip6 daddr $s tcp dport { 53, 853 } accept"
+            else
+                echo "    ip daddr $s udp dport 53 accept"
+                echo "    ip daddr $s tcp dport { 53, 853 } accept"
+            fi
+        done
+        for i in $ifaces; do
+            [ -n "$i" ] || continue
+            echo "    oifname \"$i\" udp dport 53 accept"
+            echo "    oifname \"$i\" tcp dport { 53, 853 } accept"
+        done
+        echo "    udp dport 53 drop comment \"block DNS leak\""
+        echo "    tcp dport { 53, 853 } drop comment \"block DNS/DoT leak\""
+        echo "  }"
+        echo "}"
+    } > "$RUNTIME_RULESET"
+}
+
 apply_now() { # profile
     local ev profile trusted trusted_iface ifaces endpoints bypass
     ev="$(evaluate "$1")"
     IFS='|' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
-    gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
+    if [ "$MODE" = dns ]; then
+        gen_dns_ruleset "$ifaces"
+    else
+        gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
+    fi
     nft -f "$RUNTIME_RULESET"
     mkdir -p "$STATE_DIR"
-    { echo "PROFILE=$profile"; echo "TRUSTED=$trusted"; echo "TRUSTED_IFACE=$trusted_iface"
-      echo "IFACES=\"$ifaces\""; echo "ENDPOINTS=\"$endpoints\""
-      echo "BYPASS=\"$bypass\""; } > "$CURRENT_FILE"
-    log "applied (profile=${profile:-none} trusted_gw=${trusted:-no} ifaces=${ifaces:-none})"
+    { echo "MODE=$MODE"; echo "PROFILE=$profile"; echo "TRUSTED=$trusted"
+      echo "TRUSTED_IFACE=$trusted_iface"; echo "IFACES=\"$ifaces\""
+      echo "ENDPOINTS=\"$endpoints\""; echo "BYPASS=\"$bypass\""; } > "$CURRENT_FILE"
+    log "applied (mode=$MODE profile=${profile:-none} trusted_gw=${trusted:-no} ifaces=${ifaces:-none})"
 }
 
 armed() { [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE" 2>/dev/null)" = armed ]; }
@@ -264,7 +308,7 @@ cmd_check() { require_root; evaluate "${1:-$DEFAULT_PROFILE}"; }
 # All writes go through root here so the GUI needs no direct access to /etc.
 # Keys are validated against a whitelist; values are stored verbatim but only
 # ever re-sourced as shell — so keep the allowed set boring (no code).
-CONFIG_KEYS="DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS"
+CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS"
 
 valid_key() { case " $CONFIG_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 

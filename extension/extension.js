@@ -23,11 +23,11 @@ function readTextFile(path) {
 }
 
 function parseCurrent(text) {
-    const out = {profile: '', trusted: '', ifaces: ''};
+    const out = {mode: 'full', profile: '', trusted: '', ifaces: ''};
     if (!text)
         return out;
     for (const line of text.split('\n')) {
-        const m = line.match(/^(PROFILE|TRUSTED|IFACES)=(.*)$/);
+        const m = line.match(/^(MODE|PROFILE|TRUSTED|IFACES)=(.*)$/);
         if (!m)
             continue;
         out[m[1].toLowerCase()] = m[2].trim().replace(/^"(.*)"$/, '$1');
@@ -156,7 +156,7 @@ class KillSwitchToggle extends QuickSettings.QuickMenuToggle {
 
     _refresh() {
         const armed = (readTextFile(STATE_FILE) || '').trim() === 'armed';
-        const {profile, trusted, ifaces} = parseCurrent(readTextFile(CURRENT_FILE));
+        const {mode, profile, trusted, ifaces} = parseCurrent(readTextFile(CURRENT_FILE));
 
         this._syncing = true;
         this.checked = armed;
@@ -170,6 +170,9 @@ class KillSwitchToggle extends QuickSettings.QuickMenuToggle {
         if (!armed) {
             this.iconName = 'channel-insecure-symbolic';
             this.subtitle = _('Disarmed');
+        } else if (mode === 'dns') {
+            this.iconName = 'network-wired-symbolic';
+            this.subtitle = _('DNS protection');
         } else if (trusted) {
             this.iconName = 'network-wireless-symbolic';
             this.subtitle = _('Trusted gateway');

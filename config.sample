@@ -1,7 +1,22 @@
 # nova-killswitch config — installed to /etc/nova-killswitch/config
 # Sourced as shell by the root controller; edited via the GTK app (pkexec).
 
+# Protection mode:
+#   full = fail-closed WAN kill switch (block everything except the VPN
+#          chain / trusted gateway / bypass subnets)
+#   dns  = WAN stays open, but DNS (and DoT) is forced through the trusted
+#          resolver(s) / split tunnel below — a lightweight anti-DNS-leak
+#          mode for "use the nova-node only as DNS" setups.
+MODE=full
+
+# dns mode: allowed resolver IPs (space-separated). e.g. the nova-node or the
+# DNS/split-tunnel's server, reachable via a profile tunnel:
+#   DNS_SERVERS="10.8.0.1"
+DNS_SERVERS=""
+
 # Profile armed by default (name of a file in profiles/, without .profile).
+# In dns mode a profile can still bring up the split/DNS tunnel; only DNS is
+# routed through it, the rest of your traffic stays direct.
 # Empty = no VPN chain, only trusted-gateway/bypass rules apply.
 DEFAULT_PROFILE=""
 
