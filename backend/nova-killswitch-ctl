@@ -164,12 +164,22 @@ iface_subnets() { # iface -> its directly-connected CIDRs (v4+v6)
     ip -o addr show dev "$1" 2>/dev/null | awk '{print $4}'
 }
 
-# ---- ruleset generation -----------------------------------------------------
-# Fail-closed. Accept: loopback, established, each UP VPN layer's iface, the
-# endpoints needed to (re)establish tunnels, DHCP, essential ICMP, configured
-# bypass subnets, and — only when a trusted gateway is verified — LAN to it.
-gen_ruleset() {
-    local ifaces="$1" endpoints="$2" bypass="$3" trusted_iface="$4"
+flush_conntrack() {
+    # cut pre-existing connections so nothing keeps leaking via the old path
+    command -v conntrack >/dev/null 2>&1 && conntrack -F >/dev/null 2>&1 || true
+}
+
+# ---- hardened full-mode ruleset ---------------------------------------------
+# Fail-closed. GENERAL traffic may leave ONLY via the final exit interface (the
+# last hop of the chain, or the trusted-gateway uplink). Each tunnel's handshake
+# endpoint is pinned to its CARRIER interface: layer 1's endpoint may exit the
+# base link (unavoidable — it's the outer tunnel), but layer N's endpoint may
+# exit ONLY through layer N-1's tunnel. So an inner tunnel physically cannot
+# establish unless it nests correctly, and no misroute can leak the real IP.
+#
+# ep_rules: newline-separated "carrier|endpoint" ("" carrier = base/LAN, layer 1)
+gen_full_ruleset() { # final_iface ep_rules bypass
+    local final_iface="$1" ep_rules="$2" bypass="$3"
     {
         echo "add table inet $TABLE"
         echo "delete table inet $TABLE"
@@ -178,41 +188,38 @@ gen_ruleset() {
         echo "    type filter hook output priority 0; policy drop;"
         echo "    oifname \"lo\" accept"
         echo "    ct state established,related accept"
-        local i ep sn
-        for i in $ifaces;    do [ -n "$i" ]  && echo "    oifname \"$i\" accept"; done
-        for ep in $endpoints; do [ -n "$ep" ] && { is_ipv6 "$ep" && echo "    ip6 daddr $ep accept" || echo "    ip daddr $ep accept"; }; done
-        for sn in $bypass;   do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept" || echo "    ip daddr $sn accept"; }; done
-        for sn in $MGMT_SUBNETS; do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept comment \"mgmt\"" || echo "    ip daddr $sn accept comment \"mgmt\""; }; done
+        # general traffic: only the final hop
+        [ -n "$final_iface" ] && echo "    oifname \"$final_iface\" accept comment \"final exit\""
+        # per-layer handshake endpoints, pinned to their carrier interface
+        local line carrier ep
+        printf '%s\n' "$ep_rules" | while IFS='|' read -r carrier ep; do
+            [ -n "$ep" ] || continue
+            if [ -z "$carrier" ]; then
+                is_ipv6 "$ep" && echo "    ip6 daddr $ep accept comment \"layer1 endpoint\"" \
+                              || echo "    ip daddr $ep accept comment \"layer1 endpoint\""
+            else
+                is_ipv6 "$ep" && echo "    oifname \"$carrier\" ip6 daddr $ep accept comment \"nested endpoint\"" \
+                              || echo "    oifname \"$carrier\" ip daddr $ep accept comment \"nested endpoint\""
+            fi
+        done
+        local sn
+        for sn in $bypass;       do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept comment \"bypass\"" || echo "    ip daddr $sn accept comment \"bypass\""; }; done
+        for sn in $MGMT_SUBNETS; do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 daddr $sn accept comment \"mgmt\""   || echo "    ip daddr $sn accept comment \"mgmt\""; }; done
         echo "    udp sport 68 udp dport 67 accept comment \"dhcp4\""
         echo "    udp sport 546 udp dport 547 accept comment \"dhcp6\""
-        # trusted gateway = trust its whole uplink path (the router itself is
-        # the VPN). Allow the physical uplink interface, not just the gw IP —
-        # internet traffic routed through the gateway keeps its real dest IP.
-        if [ -n "$trusted_iface" ]; then
-            echo "    oifname \"$trusted_iface\" accept comment \"trusted gateway uplink\""
-        fi
-        if [ "$ALLOW_LAN" = "1" ]; then
-            echo "    ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment \"lan\""
-            echo "    ip6 daddr fe80::/10 accept comment \"link-local\""
-        fi
         echo "  }"
         echo "  chain input {"
         echo "    type filter hook input priority 0; policy drop;"
         echo "    iifname \"lo\" accept"
         echo "    ct state established,related accept"
-        for i in $ifaces; do [ -n "$i" ] && echo "    iifname \"$i\" accept"; done
-        [ -n "$trusted_iface" ] && echo "    iifname \"$trusted_iface\" accept comment \"trusted gateway uplink\""
-        # keep management reachable so arming can't lock you out of the box
+        [ -n "$final_iface" ] && echo "    iifname \"$final_iface\" accept comment \"final exit\""
         local p
         for p in $ALLOW_IN_PORTS; do [ -n "$p" ] && echo "    tcp dport $p accept comment \"mgmt port\""; done
-        for sn in $MGMT_SUBNETS; do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 saddr $sn accept comment \"mgmt\"" || echo "    ip saddr $sn accept comment \"mgmt\""; }; done
+        for sn in $MGMT_SUBNETS;  do [ -n "$sn" ] && { is_ipv6 "$sn" && echo "    ip6 saddr $sn accept comment \"mgmt\"" || echo "    ip saddr $sn accept comment \"mgmt\""; }; done
         echo "    udp sport 67 udp dport 68 accept comment \"dhcp4\""
         echo "    udp sport 547 udp dport 546 accept comment \"dhcp6\""
         echo "    icmp type { echo-reply, destination-unreachable, time-exceeded } accept"
         echo "    icmpv6 type { echo-reply, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert, destination-unreachable, packet-too-big, time-exceeded } accept"
-        if [ "$ALLOW_LAN" = "1" ]; then
-            echo "    ip saddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 } accept comment \"lan\""
-        fi
         echo "  }"
         echo "}"
     } > "$RUNTIME_RULESET"
@@ -437,20 +444,58 @@ chain_down() {
     del_mgmt_bypass
 }
 
-apply_now() { # profile
-    # node mode (a.k.a. dns) has its own local-preferred / VPN-fallback logic
-    if [ "$MODE" = node ] || [ "$MODE" = dns ]; then node_apply; return; fi
+# walk the profile's layers in order and build the hardened full-mode ruleset.
+apply_full() { # profile
+    local profile="$1"
+    local trusted_raw trusted="" trusted_iface=""
+    if trusted_raw="$(trusted_gateway)"; then
+        trusted="${trusted_raw%%|*}"; trusted_iface="${trusted_raw#*|}"
+    fi
 
-    local ev profile trusted trusted_iface ifaces endpoints bypass
-    ev="$(evaluate "$1")"
-    IFS='|' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
-    gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
+    local pf; pf="$(profile_file "$profile")"
+    local prev_iface="" final_iface="" all_up=1 layers=0 bypass="$BYPASS_SUBNETS"
+    local ep_rules="" line res ifc eps carrier ep
+
+    if [ -z "$trusted_iface" ] && [ -n "$profile" ] && [ -r "$pf" ]; then
+        while read -r line; do
+            line="${line%%#*}"; line="$(echo "$line" | xargs)"; [ -n "$line" ] || continue
+            layers=$((layers + 1))
+            res="$(resolve_layer "$line")"; ifc="${res%%|*}"; eps="${res#*|}"
+            # carrier for this layer's endpoint: base (empty) for layer 1, else
+            # the previous tunnel. If the previous layer is down we have no
+            # carrier — skip the endpoint entirely (never allow it via LAN).
+            if [ "$layers" -eq 1 ]; then carrier=""
+            else carrier="$prev_iface"; fi
+            if [ "$layers" -eq 1 ] || [ -n "$carrier" ]; then
+                for ep in $eps; do [ -n "$ep" ] && ep_rules="$ep_rules
+$carrier|$ep"; done
+            fi
+            if [ -n "$ifc" ]; then
+                prev_iface="$ifc"
+                [ "$AUTO_BYPASS_VPN_SUBNET" = 1 ] && bypass="$bypass $(iface_subnets "$ifc" | tr '\n' ' ')"
+            else
+                all_up=0; prev_iface=""
+            fi
+        done < "$pf"
+        # general traffic exits only when the WHOLE chain is up (last hop)
+        [ "$all_up" -eq 1 ] && [ "$layers" -gt 0 ] && final_iface="$prev_iface"
+    fi
+    # trusted gateway: the router is the VPN — general traffic exits its uplink
+    [ -n "$trusted_iface" ] && final_iface="$trusted_iface"
+
+    gen_full_ruleset "$final_iface" "$ep_rules" "$bypass"
     nft -f "$RUNTIME_RULESET"
+    flush_conntrack
     mkdir -p "$STATE_DIR"
-    { echo "MODE=$MODE"; echo "PROFILE=$profile"; echo "TRUSTED=$trusted"
-      echo "TRUSTED_IFACE=$trusted_iface"; echo "IFACES=\"$ifaces\""
-      echo "ENDPOINTS=\"$endpoints\""; echo "BYPASS=\"$bypass\""; } > "$CURRENT_FILE"
-    log "applied (mode=$MODE profile=${profile:-none} trusted_gw=${trusted:-no} ifaces=${ifaces:-none})"
+    { echo "MODE=full"; echo "PROFILE=$profile"; echo "TRUSTED=$trusted"
+      echo "TRUSTED_IFACE=$trusted_iface"; echo "FINAL_IFACE=$final_iface"
+      echo "IFACES=\"$final_iface\""; } > "$CURRENT_FILE"
+    log "applied (full profile=${profile:-none} trusted_gw=${trusted:-no} exit=${final_iface:-none/blocked})"
+}
+
+apply_now() { # profile
+    if [ "$MODE" = node ] || [ "$MODE" = dns ]; then node_apply; return; fi
+    apply_full "$1"
 }
 
 armed() { [ -f "$STATE_FILE" ] && [ "$(cat "$STATE_FILE" 2>/dev/null)" = armed ]; }
