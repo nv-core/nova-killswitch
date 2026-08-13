@@ -299,24 +299,30 @@ wait_iface() { # iface timeout
     return 1
 }
 
-# route a management subnet through the MAIN table (bypassing any VPN default
-# route) so remote access survives a full-tunnel chain. Higher priority than
-# the tunnel's rules.
+# Pin each management subnet to the ORIGINAL gateway with a specific route.
+# A /24 (etc.) is more specific than any default route, so it wins even when
+# OpenVPN's redirect-gateway rewrites the main table's default or WireGuard
+# installs policy routes — remote access survives a full-tunnel chain. Capture
+# the real gateway BEFORE any tunnel comes up (chain_up calls us first).
 add_mgmt_bypass() {
-    local sn
     : > "$STATE_RULES"
+    [ -n "$MGMT_SUBNETS" ] || return 0
+    local gw iface sn
+    read -r gw iface < <(ip -o route show default 2>/dev/null | \
+        awk '{for(i=1;i<=NF;i++){if($i=="via")g=$(i+1);if($i=="dev")d=$(i+1)}} END{print g, d}')
+    [ -n "$gw" ] && [ -n "$iface" ] || return 0
     for sn in $MGMT_SUBNETS; do
         [ -n "$sn" ] || continue
-        if ! ip rule show 2>/dev/null | grep -q "to $sn lookup main"; then
-            ip rule add to "$sn" lookup main priority 1000 2>/dev/null && echo "to $sn" >> "$STATE_RULES"
-            ip rule add from "$sn" lookup main priority 1000 2>/dev/null && echo "from $sn" >> "$STATE_RULES"
+        if ip route replace "$sn" via "$gw" dev "$iface" 2>/dev/null; then
+            echo "$sn" >> "$STATE_RULES"
         fi
     done
+    log "mgmt bypass: ${MGMT_SUBNETS} via $gw dev $iface"
 }
 del_mgmt_bypass() {
     [ -f "$STATE_RULES" ] || return 0
-    local spec
-    while read -r spec; do [ -n "$spec" ] && ip rule del $spec lookup main priority 1000 2>/dev/null || true; done < "$STATE_RULES"
+    local sn
+    while read -r sn; do [ -n "$sn" ] && ip route del "$sn" 2>/dev/null || true; done < "$STATE_RULES"
     rm -f "$STATE_RULES"
 }
 
