@@ -56,6 +56,10 @@ DNS_SERVERS=""              # dns mode: allowed resolver IPs (e.g. the nova-node
 MANAGE_TUNNELS=1            # arm = bring the profile's VPN chain up (ordered,
                             #       with inter-layer routing); disarm = tear it
                             #       down. 0 = firewall only, you manage tunnels.
+AUTO_ARM=0                  # 1 = when you bring a VPN up manually, the kill
+                            #     switch arms itself around it (firewall only,
+                            #     no tunnel management). Stays armed if the VPN
+                            #     drops (fail-closed) — disarm manually.
 ALLOW_IN_PORTS="22"         # inbound TCP ports kept reachable while armed
                             #   (sshd = 22) so you never lock yourself out
 MGMT_SUBNETS=""             # management subnets (e.g. your admin LAN) that must
@@ -444,6 +448,20 @@ chain_down() {
     del_mgmt_bypass
 }
 
+# the ordered layer list for a profile: the saved profile file, or — when no
+# profile is given (auto-arm) — whatever VPN tunnels are active right now, so
+# the kill switch can wrap a connection you brought up by hand.
+profile_layers() { # profile
+    local pf; pf="$(profile_file "$1")"
+    if [ -n "$1" ] && [ -r "$pf" ]; then
+        grep -vE '^[[:space:]]*(#|$)' "$pf" 2>/dev/null | sed 's/#.*//; s/^ *//; s/ *$//' | grep -E '.'
+    else
+        # active VPN/WG connections, in activation order (last = outermost/exit)
+        nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+            | awk -F: '$2 ~ /wireguard|vpn|openvpn/ {print $1}'
+    fi
+}
+
 # walk the profile's layers in order and build the hardened full-mode ruleset.
 apply_full() { # profile
     local profile="$1"
@@ -452,13 +470,12 @@ apply_full() { # profile
         trusted="${trusted_raw%%|*}"; trusted_iface="${trusted_raw#*|}"
     fi
 
-    local pf; pf="$(profile_file "$profile")"
     local prev_iface="" final_iface="" all_up=1 layers=0 bypass="$BYPASS_SUBNETS"
     local ep_rules="" line res ifc eps carrier ep
 
-    if [ -z "$trusted_iface" ] && [ -n "$profile" ] && [ -r "$pf" ]; then
+    if [ -z "$trusted_iface" ]; then
         while read -r line; do
-            line="${line%%#*}"; line="$(echo "$line" | xargs)"; [ -n "$line" ] || continue
+            [ -n "$line" ] || continue
             layers=$((layers + 1))
             res="$(resolve_layer "$line")"; ifc="${res%%|*}"; eps="${res#*|}"
             # carrier for this layer's endpoint: base (empty) for layer 1, else
@@ -476,7 +493,7 @@ $carrier|$ep"; done
             else
                 all_up=0; prev_iface=""
             fi
-        done < "$pf"
+        done < <(profile_layers "$profile")
         # general traffic exits only when the WHOLE chain is up (last hop)
         [ "$all_up" -eq 1 ] && [ "$layers" -gt 0 ] && final_iface="$prev_iface"
     fi
@@ -528,6 +545,17 @@ cmd_sync() {
     [ -f "$CURRENT_FILE" ] && profile="$(sed -n 's/^PROFILE=//p' "$CURRENT_FILE")"
     apply_now "${profile:-$DEFAULT_PROFILE}"
 }
+# auto-arm: called by the NM dispatcher when a VPN comes up (AUTO_ARM=1).
+# Wraps whatever is active — firewall only, never manages tunnels — and stays
+# armed if the VPN later drops (fail-closed; disarm by hand).
+cmd_auto_arm() {
+    require_root; mkdir -p "$STATE_DIR"
+    [ "$AUTO_ARM" = 1 ] || exit 0
+    if armed; then cmd_sync; return; fi
+    echo armed > "$STATE_FILE"
+    apply_now "$DEFAULT_PROFILE"     # empty profile -> protect the active VPN(s)
+    log "auto-armed (a VPN came up)"
+}
 cmd_restore() {
     require_root; armed || exit 0
     local profile=""
@@ -561,7 +589,7 @@ cmd_list_vpns() {
 # All writes go through root here so the GUI needs no direct access to /etc.
 # Keys are validated against a whitelist; values are stored verbatim but only
 # ever re-sourced as shell — so keep the allowed set boring (no code).
-CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS MANAGE_TUNNELS ALLOW_IN_PORTS MGMT_SUBNETS NODE_LOCAL NODE_VPN NODE_TUNNEL"
+CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS MANAGE_TUNNELS AUTO_ARM ALLOW_IN_PORTS MGMT_SUBNETS NODE_LOCAL NODE_VPN NODE_TUNNEL"
 
 valid_key() { case " $CONFIG_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
@@ -615,6 +643,7 @@ cmd_profile_delete() {
 case "${1:-}" in
     enable)  shift; cmd_enable "${1:-}" ;;
     disable) cmd_disable ;;
+    auto-arm) cmd_auto_arm ;;
     sync)    cmd_sync ;;
     restore) cmd_restore ;;
     status)  cmd_status ;;

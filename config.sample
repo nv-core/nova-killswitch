@@ -46,6 +46,11 @@ TRUSTED_GATEWAYS=""
 # the tunnels yourself.
 MANAGE_TUNNELS=1
 
+# Auto-arm: when you bring a VPN up yourself (nmcli/GNOME), arm the kill switch
+# around it automatically (firewall only, no tunnel management). It stays armed
+# if the VPN later drops (fail-closed) — disarm by hand. 0 = off.
+AUTO_ARM=0
+
 # Inbound TCP ports kept reachable while armed so you never lock yourself out
 # of the machine (sshd = 22). Space-separated.
 ALLOW_IN_PORTS="22"

@@ -93,6 +93,14 @@ class Window(Adw.ApplicationWindow):
         self.manage.connect("notify::active", lambda *_: self._loading or
                             self._save("MANAGE_TUNNELS", "1" if self.manage.get_active() else "0"))
         grp.add(self.manage)
+
+        self.auto_arm = Adw.SwitchRow(
+            title="Auto-arm on VPN up",
+            subtitle="When you connect a VPN yourself, arm the kill switch around it "
+                     "(stays armed if the VPN drops — disarm here)")
+        self.auto_arm.connect("notify::active", lambda *_: self._loading or
+                             self._save("AUTO_ARM", "1" if self.auto_arm.get_active() else "0"))
+        grp.add(self.auto_arm)
         page.add(grp)
 
     # ---- FULL mode groups ---------------------------------------------------
@@ -198,6 +206,7 @@ class Window(Adw.ApplicationWindow):
         is_node = mode in ("node", "dns")
         self.mode.set_selected(1 if is_node else 0)
         self.manage.set_active(cfg.get("MANAGE_TUNNELS", "1") == "1")
+        self.auto_arm.set_active(cfg.get("AUTO_ARM", "0") == "1")
 
         # full-mode fields
         self.allow_lan.set_active(cfg.get("ALLOW_LAN", "0") == "1")
