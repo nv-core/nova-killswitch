@@ -1,14 +1,21 @@
 // Passwordless arm/disarm/config for the kill switch. Authorizes pkexec of
 // exactly one root-owned, non-user-writable program for active wheel users.
-// (We intentionally do NOT require subject.local: VM consoles and some
-// desktop sessions report non-local, which was causing password prompts.
-// Safe because the target program is root-owned and not user-writable.)
+//
+// IMPORTANT: pkexec canonicalizes the program path. On Silverblue/Bluefin
+// /usr/local is a symlink to /var/usrlocal, so polkit sees the RESOLVED path
+// (/var/usrlocal/sbin/...). We match both so the rule fires on ostree systems
+// and normal Fedora alike. subject.local is intentionally not required (some
+// desktop/VM sessions report non-local); active + wheel is sufficient because
+// the target is root-owned and not user-writable.
 polkit.addRule(function(action, subject) {
     if (!(subject.isInGroup("wheel") && subject.active))
         return;
-    if (action.id == "org.freedesktop.policykit.exec" &&
-        action.lookup("program") == "/usr/local/sbin/nova-killswitch-ctl") {
-        return polkit.Result.YES;
+    if (action.id == "org.freedesktop.policykit.exec") {
+        var p = action.lookup("program");
+        if (p == "/usr/local/sbin/nova-killswitch-ctl" ||
+            p == "/var/usrlocal/sbin/nova-killswitch-ctl") {
+            return polkit.Result.YES;
+        }
     }
     if (action.id == "org.freedesktop.systemd1.manage-units") {
         var unit = action.lookup("unit");
