@@ -187,9 +187,29 @@ class Net:
         return [ln.split()[3] for ln in r.stdout.splitlines() if len(ln.split()) > 3]
 
     @staticmethod
+    def static_endpoints(spec):
+        """Endpoints from the connection's saved config — works while the
+        connection is INACTIVE, which is essential: the fail-closed firewall
+        must allow the handshake BEFORE the tunnel exists."""
+        eps = []
+        out = run(["nmcli", "-t", "-f", "wireguard.peers", "connection", "show", spec]).stdout
+        for m in re.finditer(r"endpoint=([^,\s]+)", out):
+            eps.append(m.group(1))
+        if not eps:
+            data = run(["nmcli", "-t", "-f", "vpn.data", "connection", "show", spec]).stdout
+            # nmcli separates vpn.data keys with ", " and escapes commas INSIDE
+            # a value as "\," — the remote value ends at the first unescaped ", ".
+            m = re.search(r"remote = ((?:\\,|[^,])+)", data)
+            if m:
+                eps = [r0.strip() for r0 in m.group(1).split("\\,")]
+        return eps
+
+    @staticmethod
     def resolve_layer(spec):
         """(iface, [endpoints]) for a VPN connection/iface. iface only if it's a
-        REAL tunnel (never the physical NIC — that would defeat the switch)."""
+        REAL tunnel (never the physical NIC — that would defeat the switch).
+        Endpoints are returned even while the connection is down (static
+        config), so the firewall can permit the tunnel to establish."""
         iface, eps = "", []
         # native wireguard iface?
         if run(["wg", "show", spec]).returncode == 0:
@@ -198,19 +218,13 @@ class Net:
             eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
         elif Net.conn_active(spec):
             iface = Net.ip_iface(spec)
-            data = run(["nmcli", "-t", "-f", "vpn.data", "connection", "show", spec]).stdout
-            # nmcli separates vpn.data keys with ", " and escapes commas INSIDE
-            # a value as "\,". The remote value therefore ends at the first
-            # unescaped ", " — match runs of (escaped-comma | non-comma).
-            m = re.search(r"remote = ((?:\\,|[^,])+)", data)
-            if m:
-                for r0 in m.group(1).split("\\,"):
-                    eps.append(r0.strip().split(":")[0])
-            if not eps and iface and Net.iface_up(iface):
+            if iface and Net.iface_up(iface) and run(["wg", "show", iface]).returncode == 0:
                 r = run(["wg", "show", iface, "endpoints"])
                 eps = [l.split()[1] for l in r.stdout.splitlines() if len(l.split()) > 1]
         elif spec and Net.iface_up(spec):
             iface = spec
+        if not eps:
+            eps = Net.static_endpoints(spec)
 
         if iface and not Net.iface_up(iface):
             iface = ""

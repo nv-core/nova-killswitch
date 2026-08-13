@@ -1,7 +1,7 @@
 # nova.manifest — app metadata for the nova updater
 NAME=nova-killswitch
 DESCRIPTION=Dynamic VPN kill switch / firewall manager: root daemon (D-Bus, NetworkManager-reactive), GNOME toggle + GTK app + CLI — passwordless
-VERSION=1.1.0
+VERSION=1.1.1
 TYPE=cli+gui
 SCOPE=both
 INSTALLER=install.sh
