@@ -47,13 +47,18 @@ sys_install() {
     busctl call org.freedesktop.DBus /org/freedesktop/DBus org.freedesktop.DBus ReloadConfig 2>/dev/null \
         || systemctl reload dbus-broker 2>/dev/null || systemctl reload dbus 2>/dev/null || true
     systemctl daemon-reload
-    systemctl enable --now nova-killswitchd.service
-    systemctl restart nova-killswitchd.service 2>/dev/null || true
+    systemctl enable nova-killswitchd.service 2>/dev/null || true
+    systemctl restart nova-killswitchd.service
+    # wait until the daemon actually owns its bus name (ownership is async)
+    for _ in $(seq 20); do
+        busctl list 2>/dev/null | grep -q org.novanetwork.KillSwitch && break
+        sleep 0.25
+    done
     say "daemon installed — control it from the GNOME toggle, the settings app,"
     say "or the terminal: nova-killswitch status | arm [chain] | disarm"
 }
 
-sys_update() { sys_install; systemctl restart nova-killswitchd.service 2>/dev/null || true; }
+sys_update() { sys_install; }
 
 sys_uninstall() {
     say "stopping + removing the kill switch daemon"
