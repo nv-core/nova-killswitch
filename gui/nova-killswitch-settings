@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """nova-killswitch-settings — GTK4/libadwaita settings for the Nova kill switch.
 
-The app has NO privileges: every read/write of /etc/nova-killswitch goes
-through `pkexec nova-killswitch-ctl {config-get,config-set,profile-*}`.
+Mode-driven: pick Full or Node protection and only the relevant options show.
+The app has NO privileges — every read/write goes through
+`pkexec nova-killswitch-ctl {config-get,config-set,profile-*,list-vpns}`.
 """
 import os
 import shutil
@@ -41,175 +42,248 @@ def ctl(args, root=False, stdin=None):
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="Nova Kill Switch")
-        self.set_default_size(680, 760)
+        self.set_default_size(640, 820)
         self._loading = False
-        self._arm_guard = False
+        self._vpns = []          # [(name, type, active)]
 
         header = Adw.HeaderBar()
         header.set_title_widget(Adw.WindowTitle(title="Nova Kill Switch",
-                                                subtitle="VPN kill switch settings"))
-        self.toasts = Adw.ToastOverlay()
+                                                subtitle="VPN protection"))
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Refresh")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_end(refresh)
 
+        self.toasts = Adw.ToastOverlay()
         page = Adw.PreferencesPage()
         self._build_status(page)
-        self._build_general(page)
-        self._build_gateways(page)
-        self._build_profiles(page)
+        self._build_mode(page)
+        self._build_full(page)     # full-mode groups
+        self._build_node(page)     # node-mode groups
+        self._build_mgmt(page)     # common
 
-        scroll = Gtk.ScrolledWindow(child=page, vexpand=True)
-        self.toasts.set_child(scroll)
+        self.toasts.set_child(Gtk.ScrolledWindow(child=page, vexpand=True))
         view = Adw.ToolbarView(content=self.toasts)
         view.add_top_bar(header)
         self.set_content(view)
-
         self.reload()
 
-    # ---- status group -------------------------------------------------------
+    # ---- status + big on/off -----------------------------------------------
     def _build_status(self, page):
-        grp = Adw.PreferencesGroup(title="Status")
-        self.status_row = Adw.ActionRow(title="Kill switch", subtitle="…")
-        self.arm_switch = Gtk.Switch(valign=Gtk.Align.CENTER)
-        self.arm_switch.connect("notify::active", self._on_arm)
-        self._arm_guard = False
-        self.status_row.add_suffix(self.arm_switch)
-        grp.add(self.status_row)
+        grp = Adw.PreferencesGroup()
+        self.arm_row = Adw.SwitchRow(title="Protection",
+                                     subtitle="Arm the kill switch")
+        self.arm_row.connect("notify::active", self._on_arm)
+        grp.add(self.arm_row)
         page.add(grp)
 
-    # ---- general group ------------------------------------------------------
-    def _build_general(self, page):
-        grp = Adw.PreferencesGroup(title="General",
-                                   description="Applied immediately; re-syncs if armed.")
-
-        self.mode = Adw.ComboRow(title="Protection mode",
-                                 subtitle="Full = block all WAN except VPN; "
-                                          "DNS = keep WAN, force DNS through the tunnel")
-        self.mode.set_model(Gtk.StringList.new(["Full kill switch", "DNS only"]))
-        self.mode.connect("notify::selected", lambda *_: self._loading or
-                          self._save("MODE", "dns" if self.mode.get_selected() == 1 else "full"))
+    # ---- mode ---------------------------------------------------------------
+    def _build_mode(self, page):
+        grp = Adw.PreferencesGroup(title="Mode")
+        self.mode = Adw.ComboRow(title="Protection mode")
+        self.mode.set_model(Gtk.StringList.new([
+            "Full kill switch  —  route everything through the VPN chain",
+            "Node access  —  prefer the local nova-node, VPN only if needed",
+        ]))
+        self.mode.connect("notify::selected", self._on_mode)
         grp.add(self.mode)
 
-        self.dns_servers = Adw.EntryRow(title="DNS resolvers (DNS mode)")
-        self.dns_servers.set_show_apply_button(True)
-        self.dns_servers.connect("apply", lambda *_: self._save("DNS_SERVERS", self.dns_servers.get_text()))
-        grp.add(self.dns_servers)
+        self.manage = Adw.SwitchRow(
+            title="Manage tunnels automatically",
+            subtitle="Arming brings the VPN(s) up in order; disarming stops them")
+        self.manage.connect("notify::active", lambda *_: self._loading or
+                            self._save("MANAGE_TUNNELS", "1" if self.manage.get_active() else "0"))
+        grp.add(self.manage)
+        page.add(grp)
 
-        self.default_profile = Adw.EntryRow(title="Default profile")
-        self.default_profile.connect("apply", lambda *_: self._save("DEFAULT_PROFILE",
-                                                                     self.default_profile.get_text()))
-        self.default_profile.set_show_apply_button(True)
-        grp.add(self.default_profile)
+    # ---- FULL mode groups ---------------------------------------------------
+    def _build_full(self, page):
+        # profiles / chains
+        self.full_profiles = Adw.PreferencesGroup(
+            title="VPN Chains",
+            description="An ordered set of tunnels. Layer 1 is the base; each "
+                        "one below is routed through the one above.")
+        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
+                         tooltip_text="New chain")
+        add.add_css_class("flat")
+        add.connect("clicked", lambda *_: self._edit_profile(None))
+        self.full_profiles.set_header_suffix(add)
+        page.add(self.full_profiles)
+
+        # options
+        self.full_opts = Adw.PreferencesGroup(title="Full-mode Options")
+        self.default_profile = Adw.ComboRow(title="Default chain",
+                                            subtitle="Armed when you flip the switch")
+        self.default_profile.connect("notify::selected", self._on_default_profile)
+        self.full_opts.add(self.default_profile)
 
         self.allow_lan = Adw.SwitchRow(title="Allow LAN while armed",
-                                       subtitle="Permit RFC1918 / link-local traffic")
+                                       subtitle="Reach devices on your local network")
         self.allow_lan.connect("notify::active", lambda *_: self._loading or
-                               self._save("ALLOW_LAN", "1" if self.allow_lan.get_active() else "0"))
-        grp.add(self.allow_lan)
-
-        self.auto_bypass = Adw.SwitchRow(title="Auto-bypass VPN subnets",
-                                         subtitle="Allow each active tunnel's own subnet")
-        self.auto_bypass.connect("notify::active", lambda *_: self._loading or
-                                 self._save("AUTO_BYPASS_VPN_SUBNET",
-                                            "1" if self.auto_bypass.get_active() else "0"))
-        grp.add(self.auto_bypass)
+                              self._save("ALLOW_LAN", "1" if self.allow_lan.get_active() else "0"))
+        self.full_opts.add(self.allow_lan)
 
         self.bypass = Adw.EntryRow(title="Bypass subnets")
         self.bypass.set_show_apply_button(True)
         self.bypass.connect("apply", lambda *_: self._save("BYPASS_SUBNETS", self.bypass.get_text()))
-        grp.add(self.bypass)
-        page.add(grp)
+        self.full_opts.add(self.bypass)
+        page.add(self.full_opts)
 
-    # ---- trusted gateways ---------------------------------------------------
-    def _build_gateways(self, page):
-        grp = Adw.PreferencesGroup(
+        # trusted gateways
+        self.full_gw = Adw.PreferencesGroup(
             title="Trusted Gateways",
-            description="Local VPN routers. Format: IP/MAC space-separated. "
-                        "A gateway is trusted only if IP and MAC both match.")
+            description="Your nova-nodes / VPN routers (IP/MAC). On these "
+                        "networks the VPN chain can be skipped.")
         self.gateways = Adw.EntryRow(title="IP/MAC list")
         self.gateways.set_show_apply_button(True)
         self.gateways.connect("apply", lambda *_: self._save("TRUSTED_GATEWAYS", self.gateways.get_text()))
-        grp.add(self.gateways)
-        detect = Gtk.Button(label="Add current gateway…", halign=Gtk.Align.START,
+        self.full_gw.add(self.gateways)
+        detect = Gtk.Button(label="Add current gateway", halign=Gtk.Align.START,
                             margin_top=6)
         detect.add_css_class("flat")
         detect.connect("clicked", self._detect_gateway)
-        grp.add(detect)
-        page.add(grp)
+        self.full_gw.add(detect)
+        page.add(self.full_gw)
 
-    # ---- profiles -----------------------------------------------------------
-    def _build_profiles(self, page):
+    # ---- NODE mode group ----------------------------------------------------
+    def _build_node(self, page):
+        self.node_grp = Adw.PreferencesGroup(
+            title="Nova-Node",
+            description="Preferred on the LAN. If it can't be reached there, "
+                        "the split VPN below is brought up to reach it — DNS is "
+                        "always forced to the node, and blocked if neither works.")
+        self.node_local = Adw.EntryRow(title="Node LAN address")
+        self.node_local.set_show_apply_button(True)
+        self.node_local.connect("apply", lambda *_: self._save("NODE_LOCAL", self.node_local.get_text()))
+        self.node_grp.add(self.node_local)
+
+        self.node_vpn = Adw.EntryRow(title="Node VPN address")
+        self.node_vpn.set_show_apply_button(True)
+        self.node_vpn.connect("apply", lambda *_: self._save("NODE_VPN", self.node_vpn.get_text()))
+        self.node_grp.add(self.node_vpn)
+
+        self.node_tunnel = Adw.ComboRow(title="Split VPN to the node",
+                                        subtitle="Brought up only when the LAN node is unreachable")
+        self.node_tunnel.connect("notify::selected", self._on_node_tunnel)
+        self.node_grp.add(self.node_tunnel)
+        page.add(self.node_grp)
+
+    # ---- common management --------------------------------------------------
+    def _build_mgmt(self, page):
         grp = Adw.PreferencesGroup(
-            title="VPN Chain Profiles",
-            description="A profile is an ordered list of layers (one VPN "
-                        "connection/interface per line). Layer 2 tunnels over "
-                        "layer 1, and so on.")
-        add = Gtk.Button(icon_name="list-add-symbolic", valign=Gtk.Align.CENTER,
-                         tooltip_text="New profile")
-        add.add_css_class("flat")
-        add.connect("clicked", lambda *_: self._edit_profile(None))
-        grp.set_header_suffix(add)
-        self.profiles_group = grp
+            title="Stay Reachable",
+            description="So arming can never lock you out of this machine.")
+        self.allow_ports = Adw.EntryRow(title="Keep these inbound ports open")
+        self.allow_ports.set_show_apply_button(True)
+        self.allow_ports.connect("apply", lambda *_: self._save("ALLOW_IN_PORTS", self.allow_ports.get_text()))
+        grp.add(self.allow_ports)
+
+        self.mgmt_subnets = Adw.EntryRow(title="Management subnets")
+        self.mgmt_subnets.set_show_apply_button(True)
+        self.mgmt_subnets.connect("apply", lambda *_: self._save("MGMT_SUBNETS", self.mgmt_subnets.get_text()))
+        grp.add(self.mgmt_subnets)
         page.add(grp)
 
     # ---- data ---------------------------------------------------------------
     def reload(self):
         self._loading = True
-        # status (no root needed to read state files, but ctl status is simplest)
         rc, out, _ = ctl(["status"])
         armed = "STATE=armed" in out
-        self._arm_guard = True
-        self.arm_switch.set_active(armed)
-        self._arm_guard = False
-        prof = ""
-        trusted = ""
-        for line in out.splitlines():
-            if line.startswith("PROFILE="):
-                prof = line.split("=", 1)[1]
-            if line.startswith("TRUSTED="):
-                trusted = line.split("=", 1)[1]
-        if not armed:
-            self.status_row.set_subtitle("Disarmed")
-        elif trusted:
-            self.status_row.set_subtitle(f"Armed · trusted gateway ({trusted.split('/')[0]})")
-        else:
-            self.status_row.set_subtitle(f"Armed · profile “{prof or 'default'}”")
+        self.arm_row.set_active(armed)
+        cur = self._kv(out)
+        self.arm_row.set_subtitle(self._status_text(armed, cur))
 
-        # config (readable without root)
-        cfg = {}
         rc, out, _ = ctl(["config-get"])
-        for line in out.splitlines():
-            if "=" in line and not line.startswith("#"):
-                k, v = line.split("=", 1)
-                cfg[k] = v.strip().strip('"')
-        self.mode.set_selected(1 if cfg.get("MODE", "full") == "dns" else 0)
-        self.dns_servers.set_text(cfg.get("DNS_SERVERS", ""))
-        self.default_profile.set_text(cfg.get("DEFAULT_PROFILE", ""))
+        cfg = self._kv(out)
+        mode = cfg.get("MODE", "full")
+        is_node = mode in ("node", "dns")
+        self.mode.set_selected(1 if is_node else 0)
+        self.manage.set_active(cfg.get("MANAGE_TUNNELS", "1") == "1")
+
+        # full-mode fields
         self.allow_lan.set_active(cfg.get("ALLOW_LAN", "0") == "1")
-        self.auto_bypass.set_active(cfg.get("AUTO_BYPASS_VPN_SUBNET", "1") == "1")
         self.bypass.set_text(cfg.get("BYPASS_SUBNETS", ""))
         self.gateways.set_text(cfg.get("TRUSTED_GATEWAYS", ""))
 
-        self._reload_profiles()
+        # node-mode fields
+        self.node_local.set_text(cfg.get("NODE_LOCAL", ""))
+        self.node_vpn.set_text(cfg.get("NODE_VPN", ""))
+
+        # management
+        self.allow_ports.set_text(cfg.get("ALLOW_IN_PORTS", "22"))
+        self.mgmt_subnets.set_text(cfg.get("MGMT_SUBNETS", ""))
+
+        self._reload_vpns(cfg)
+        self._reload_profiles(cfg.get("DEFAULT_PROFILE", ""))
+        self._apply_mode_visibility(is_node)
         self._loading = False
 
-    def _reload_profiles(self):
-        # clear old rows
-        for row in getattr(self, "_profile_rows", []):
-            self.profiles_group.remove(row)
-        self._profile_rows = []
+    def _kv(self, text):
+        d = {}
+        for line in text.splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                d[k.strip()] = v.strip().strip('"')
+        return d
+
+    def _status_text(self, armed, cur):
+        if not armed:
+            return "Disarmed"
+        if cur.get("MODE") == "node":
+            p = cur.get("NODE_PATH", "")
+            return {"local": "Armed · using local nova-node",
+                    "vpn": "Armed · using nova-node over VPN",
+                    "none": "Armed · node unreachable (DNS blocked)"}.get(p, "Armed · node mode")
+        prof = cur.get("PROFILE", "")
+        if cur.get("TRUSTED"):
+            return f"Armed · trusted gateway ({cur['TRUSTED'].split('/')[0]})"
+        return f"Armed · chain “{prof or 'default'}”"
+
+    def _apply_mode_visibility(self, is_node):
+        self.full_profiles.set_visible(not is_node)
+        self.full_opts.set_visible(not is_node)
+        self.full_gw.set_visible(not is_node)
+        self.node_grp.set_visible(is_node)
+
+    def _reload_vpns(self, cfg):
+        rc, out, _ = ctl(["list-vpns"])
+        self._vpns = []
+        for line in out.splitlines():
+            p = line.split("\t")
+            if len(p) >= 2:
+                self._vpns.append((p[0], p[1], len(p) > 2 and p[2] == "yes"))
+        names = ["(none)"] + [n for n, _, _ in self._vpns]
+        model = Gtk.StringList.new(names)
+        self.node_tunnel.set_model(model)
+        want = cfg.get("NODE_TUNNEL", "")
+        self.node_tunnel.set_selected(names.index(want) if want in names else 0)
+
+    def _reload_profiles(self, default):
         rc, out, _ = ctl(["profile-list"])
-        for name in [n for n in out.split() if n]:
+        self._profiles = [n for n in out.split() if n]
+        # rebuild profiles list group
+        for row in getattr(self, "_profile_rows", []):
+            self.full_profiles.remove(row)
+        self._profile_rows = []
+        if not self._profiles:
+            empty = Adw.ActionRow(title="No chains yet",
+                                  subtitle="Use + to build one from your VPN connections")
+            self.full_profiles.add(empty)
+            self._profile_rows.append(empty)
+        for name in self._profiles:
             row = Adw.ActionRow(title=name)
             edit = Gtk.Button(icon_name="document-edit-symbolic", valign=Gtk.Align.CENTER)
             edit.add_css_class("flat")
             edit.connect("clicked", lambda _b, n=name: self._edit_profile(n))
             delete = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
-            delete.add_css_class("flat")
-            delete.add_css_class("error")
+            delete.add_css_class("flat"); delete.add_css_class("error")
             delete.connect("clicked", lambda _b, n=name: self._delete_profile(n))
-            row.add_suffix(edit)
-            row.add_suffix(delete)
-            self.profiles_group.add(row)
+            row.add_suffix(edit); row.add_suffix(delete)
+            self.full_profiles.add(row)
             self._profile_rows.append(row)
+        # default-chain combo
+        names = ["(none)"] + self._profiles
+        self.default_profile.set_model(Gtk.StringList.new(names))
+        self.default_profile.set_selected(names.index(default) if default in names else 0)
 
     # ---- actions ------------------------------------------------------------
     def _save(self, key, value):
@@ -218,29 +292,45 @@ class Window(Adw.ApplicationWindow):
         if rc == 0:
             self.reload()
 
-    def _on_arm(self, *_):
-        if self._arm_guard:
+    def _on_mode(self, *_):
+        if self._loading:
             return
-        want = self.arm_switch.get_active()
+        self._save("MODE", "node" if self.mode.get_selected() == 1 else "full")
+
+    def _on_default_profile(self, *_):
+        if self._loading:
+            return
+        sel = self.default_profile.get_selected()
+        val = "" if sel == 0 else self._profiles[sel - 1]
+        self._save("DEFAULT_PROFILE", val)
+
+    def _on_node_tunnel(self, *_):
+        if self._loading:
+            return
+        sel = self.node_tunnel.get_selected()
+        val = "" if sel == 0 else self._vpns[sel - 1][0]
+        self._save("NODE_TUNNEL", val)
+
+    def _on_arm(self, *_):
+        if self._loading:
+            return
+        want = self.arm_row.get_active()
         rc, _, err = ctl(["enable"] if want else ["disable"], root=True)
         if rc != 0:
             self.toast(f"Failed: {err.strip() or rc}")
         self.reload()
 
     def _detect_gateway(self, *_):
-        # find default gw + its MAC without privileges
         try:
             gw = subprocess.run(["ip", "-o", "route", "show", "default"],
-                                capture_output=True, text=True, timeout=5).stdout
-            parts = gw.split()
-            ip = parts[parts.index("via") + 1] if "via" in parts else ""
+                                capture_output=True, text=True, timeout=5).stdout.split()
+            ip = gw[gw.index("via") + 1] if "via" in gw else ""
             mac = ""
             if ip:
                 subprocess.run(["ping", "-c1", "-W1", ip], capture_output=True, timeout=3)
                 ne = subprocess.run(["ip", "neigh", "show", ip],
-                                    capture_output=True, text=True, timeout=5).stdout
-                np = ne.split()
-                mac = np[np.index("lladdr") + 1] if "lladdr" in np else ""
+                                    capture_output=True, text=True, timeout=5).stdout.split()
+                mac = ne[ne.index("lladdr") + 1] if "lladdr" in ne else ""
         except Exception:  # noqa: BLE001
             ip = mac = ""
         if not (ip and mac):
@@ -260,35 +350,23 @@ class Window(Adw.ApplicationWindow):
         self.reload()
 
     def _vpn_list(self):
-        """Available VPN/WG connections: [(name, type, active)]."""
-        rc, out, _ = ctl(["list-vpns"])
-        vpns = []
-        for line in out.splitlines():
-            p = line.split("\t")
-            if len(p) >= 2:
-                vpns.append((p[0], p[1], (len(p) > 2 and p[2] == "yes")))
-        return vpns
+        return self._vpns
 
     def _profile_layers(self, name):
         if not name:
             return []
         rc, out, _ = ctl(["profile-get", name])
-        layers = []
-        for line in out.splitlines():
-            line = line.split("#", 1)[0].strip()
-            if line:
-                layers.append(line)
-        return layers
+        return [ln.split("#", 1)[0].strip() for ln in out.splitlines()
+                if ln.split("#", 1)[0].strip()]
 
     def _edit_profile(self, name):
-        dlg = Adw.Window(title=("Edit " + name) if name else "New profile",
+        dlg = Adw.Window(title=("Edit " + name) if name else "New chain",
                          transient_for=self, modal=True)
         dlg.set_default_size(500, 560)
         tb = Adw.ToolbarView()
         h = Adw.HeaderBar()
-        name_entry = Gtk.Entry(placeholder_text="profile name", text=name or "",
-                               sensitive=name is None, hexpand=True,
-                               valign=Gtk.Align.CENTER)
+        name_entry = Gtk.Entry(placeholder_text="chain name", text=name or "",
+                               sensitive=name is None, hexpand=True, valign=Gtk.Align.CENTER)
         h.set_title_widget(name_entry)
         save = Gtk.Button(label="Save")
         save.add_css_class("suggested-action")
@@ -297,13 +375,10 @@ class Window(Adw.ApplicationWindow):
 
         vpns = self._vpn_list()
         existing = self._profile_layers(name)
-        vpn_types = {n: t for n, t, _ in vpns}
-        vpn_active = {n: a for n, _, a in vpns}
-        # order: existing layers first (in saved order), then the rest
-        ordered = [n for n in existing if n in vpn_types] + \
-                  [n for n, _, _ in vpns if n not in existing]
-        # include any profile layer whose connection no longer exists (keep it)
-        ordered += [n for n in existing if n not in vpn_types]
+        vt = {n: t for n, t, _ in vpns}
+        va = {n: a for n, _, a in vpns}
+        ordered = [n for n in existing if n in vt] + [n for n, _, _ in vpns if n not in existing]
+        ordered += [n for n in existing if n not in vt]
 
         listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         listbox.add_css_class("boxed-list")
@@ -319,71 +394,54 @@ class Window(Adw.ApplicationWindow):
                     r.set_title(r._conn)
 
         def move(row, delta):
-            i = self._pe_rows.index(row)
-            j = i + delta
+            i = self._pe_rows.index(row); j = i + delta
             if 0 <= j < len(self._pe_rows):
                 self._pe_rows[i], self._pe_rows[j] = self._pe_rows[j], self._pe_rows[i]
-                listbox.remove(row)
-                listbox.insert(row, j)
-                renumber()
+                listbox.remove(row); listbox.insert(row, j); renumber()
 
         for conn in ordered:
-            typ = vpn_types.get(conn, "missing")
             row = Adw.ActionRow(title=conn)
             row._conn = conn
-            sub = typ + ("  · active" if vpn_active.get(conn) else "")
-            row.set_subtitle(sub)
+            row.set_subtitle(vt.get(conn, "missing") + ("  · active" if va.get(conn) else ""))
             chk = Gtk.CheckButton(valign=Gtk.Align.CENTER, active=(conn in existing))
             chk.connect("toggled", lambda *_: renumber())
             row._check = chk
             row.add_prefix(chk)
-            up = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.CENTER)
-            up.add_css_class("flat")
+            up = Gtk.Button(icon_name="go-up-symbolic", valign=Gtk.Align.CENTER); up.add_css_class("flat")
             up.connect("clicked", lambda _b, r=row: move(r, -1))
-            dn = Gtk.Button(icon_name="go-down-symbolic", valign=Gtk.Align.CENTER)
-            dn.add_css_class("flat")
+            dn = Gtk.Button(icon_name="go-down-symbolic", valign=Gtk.Align.CENTER); dn.add_css_class("flat")
             dn.connect("clicked", lambda _b, r=row: move(r, +1))
-            row.add_suffix(up)
-            row.add_suffix(dn)
-            listbox.append(row)
-            self._pe_rows.append(row)
+            row.add_suffix(up); row.add_suffix(dn)
+            listbox.append(row); self._pe_rows.append(row)
         renumber()
 
-        hint = Gtk.Label(
-            label="Tick the tunnels in this chain and order them: layer 1 (top) "
-                  "is the base tunnel, each one below is routed through the one above.",
-            wrap=True, xalign=0, margin_top=6, margin_bottom=6)
-        hint.add_css_class("dim-label")
-        hint.add_css_class("caption")
-
+        hint = Gtk.Label(label="Tick the tunnels in this chain and order them: "
+                               "layer 1 (top) is the base; each below routes through the one above.",
+                         wrap=True, xalign=0, margin_top=6, margin_bottom=6)
+        hint.add_css_class("dim-label"); hint.add_css_class("caption")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
                       margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         box.append(hint)
         if not vpns:
-            empty = Adw.StatusPage(icon_name="network-vpn-symbolic",
-                                   title="No VPN connections found",
-                                   description="Create WireGuard/OpenVPN connections in "
-                                               "GNOME Settings → Network first.")
-            box.append(empty)
+            box.append(Adw.StatusPage(icon_name="network-vpn-symbolic",
+                                      title="No VPN connections",
+                                      description="Create WireGuard/OpenVPN connections in "
+                                                  "GNOME Settings → Network first."))
         else:
             box.append(listbox)
-        sc = Gtk.ScrolledWindow(child=box, vexpand=True,
-                                hscrollbar_policy=Gtk.PolicyType.NEVER)
-        tb.set_content(sc)
+        tb.set_content(Gtk.ScrolledWindow(child=box, vexpand=True,
+                                          hscrollbar_policy=Gtk.PolicyType.NEVER))
         dlg.set_content(tb)
 
         def do_save(*_):
             pname = name_entry.get_text().strip()
             if not pname:
-                self.toast("Name required")
-                return
+                self.toast("Name required"); return
             layers = [r._conn for r in self._pe_rows if r._check.get_active()]
-            text = ("# nova-killswitch chain profile — layer order = chain order\n"
-                    + "\n".join(layers) + "\n")
+            text = "# nova-killswitch chain — layer order = chain order\n" + "\n".join(layers) + "\n"
             rc, _, err = ctl(["profile-write", pname], root=True, stdin=text)
             self.toast(f"Saved {pname}" if rc == 0 else f"Failed: {err.strip()}")
-            dlg.close()
-            self.reload()
+            dlg.close(); self.reload()
 
         save.connect("clicked", do_save)
         dlg.present()
@@ -397,8 +455,7 @@ class App(Adw.Application):
         super().__init__(application_id=APP_ID)
 
     def do_activate(self):
-        win = self.get_active_window() or Window(self)
-        win.present()
+        (self.get_active_window() or Window(self)).present()
 
 
 if __name__ == "__main__":

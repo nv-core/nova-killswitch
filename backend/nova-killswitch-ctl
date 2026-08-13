@@ -35,9 +35,18 @@ TABLE=nova_ks
 
 # ---- defaults (overridable in $CONFIG_FILE) --------------------------------
 MODE=full                   # full = fail-closed WAN killswitch
-                            # dns  = WAN stays open, only DNS is forced through
-                            #        the trusted resolver/tunnel (anti-leak)
+                            # node = prefer the nova-node on the LAN; if it's
+                            #        unreachable, bring up the split VPN to
+                            #        reach it over the tunnel. WAN stays direct;
+                            #        full node access (local IP or VPN IP);
+                            #        DNS forced to the node, fail-closed if the
+                            #        node is unreachable by any path.
+                            #        ("dns" is accepted as an alias for node.)
 DEFAULT_PROFILE=""
+NODE_LOCAL=""               # node mode: nova-node LAN address/subnet (preferred)
+NODE_VPN=""                 # node mode: nova-node address over the split tunnel
+NODE_TUNNEL=""              # node mode: split VPN connection to reach the node
+                            #            when NODE_LOCAL is unreachable
 ALLOW_LAN=0                 # 1 = permit RFC1918/link-local while armed (full mode)
 BYPASS_SUBNETS=""           # extra always-allowed CIDRs (space-separated)
 AUTO_BYPASS_VPN_SUBNET=1    # auto-allow each active tunnel's own subnet
@@ -132,6 +141,17 @@ resolve_layer() {
     fi
 
     [ -n "$iface" ] && ! iface_up "$iface" && iface=""   # spec matched but link down
+
+    # SECURITY: a VPN layer's interface must be a virtual tunnel (tun/tap/wg/
+    # ppp) or the wg connection's own iface — NEVER a physical NIC. While
+    # OpenVPN is still establishing, NM briefly reports the base device
+    # (e.g. enp1s0) as IP-IFACE; allowing that would open the whole physical
+    # link. Reject anything that isn't clearly a tunnel — treat as down.
+    case "$iface" in
+        ""|tun*|tap*|wg*|ppp*|nova*) : ;;
+        "$spec") : ;;                 # NM WireGuard: iface == connection name
+        *) log "ignoring non-tunnel iface '$iface' for layer '$spec' (tunnel not up yet)"; iface="" ;;
+    esac
 
     for r in ${eps_raw:-}; do
         e="${r%:*}"; e="${e#\[}"; e="${e%\]}"     # strip :port and [] on v6
@@ -233,12 +253,36 @@ evaluate() {
         "$(echo "$ifaces" | xargs)" "$(echo "$endpoints" | xargs)" "$(echo "$bypass" | xargs)"
 }
 
-# DNS-leak-prevention ruleset: WAN stays open (policy accept), but plain DNS
-# (udp/tcp 53) and DoT (tcp 853) are only allowed to the trusted resolvers or
-# out an active VPN/split tunnel — every other DNS query is dropped. (DoH over
-# 443 can't be distinguished from HTTPS, so it isn't blocked here.)
-gen_dns_ruleset() { # ifaces
-    local ifaces="$1" s i
+# ---- node mode --------------------------------------------------------------
+# Prefer the nova-node on the LAN (NODE_LOCAL); if it can't be reached, bring
+# up the split VPN (NODE_TUNNEL) and use the node's VPN address (NODE_VPN).
+# WAN stays direct; you get full access to whichever node address is live, DNS
+# is forced to it, and if NEITHER path works DNS is blocked (fail-closed).
+reachable() { ping -c1 -W1 "${1%%/*}" >/dev/null 2>&1; }
+
+# echoes "local|vpn|none  <node-addr>  <tunnel-iface>"
+node_pick() {
+    if [ -n "$NODE_LOCAL" ] && reachable "$NODE_LOCAL"; then
+        echo "local $NODE_LOCAL "
+        return
+    fi
+    if [ -n "$NODE_TUNNEL" ]; then
+        conn_active "$NODE_TUNNEL" || nmcli connection up "$NODE_TUNNEL" >/dev/null 2>&1
+        local res ifc
+        res="$(resolve_layer "$NODE_TUNNEL")"; ifc="${res%%|*}"
+        if [ -n "$NODE_VPN" ] && { reachable "$NODE_VPN" || [ -n "$ifc" ]; }; then
+            echo "vpn $NODE_VPN $ifc"
+            return
+        fi
+    fi
+    echo "none  "
+}
+
+# WAN open (policy accept). Full access to $addr (all ports) via $iface (or
+# direct if empty). DNS forced to $addr; other DNS dropped. If $addr empty
+# (node unreachable) all DNS is dropped — fail-closed for DNS.
+gen_node_ruleset() { # node-addr node-iface
+    local addr="$1" ifc="$2"
     {
         echo "add table inet $TABLE"
         echo "delete table inet $TABLE"
@@ -246,26 +290,35 @@ gen_dns_ruleset() { # ifaces
         echo "  chain output {"
         echo "    type filter hook output priority 0; policy accept;"
         echo "    oifname \"lo\" accept"
-        for s in $DNS_SERVERS; do
-            [ -n "$s" ] || continue
-            if is_ipv6 "$s"; then
-                echo "    ip6 daddr $s udp dport 53 accept"
-                echo "    ip6 daddr $s tcp dport { 53, 853 } accept"
-            else
-                echo "    ip daddr $s udp dport 53 accept"
-                echo "    ip daddr $s tcp dport { 53, 853 } accept"
-            fi
-        done
-        for i in $ifaces; do
-            [ -n "$i" ] || continue
-            echo "    oifname \"$i\" udp dport 53 accept"
-            echo "    oifname \"$i\" tcp dport { 53, 853 } accept"
-        done
-        echo "    udp dport 53 drop comment \"block DNS leak\""
-        echo "    tcp dport { 53, 853 } drop comment \"block DNS/DoT leak\""
+        if [ -n "$addr" ]; then
+            if is_ipv6 "$addr"; then echo "    ip6 daddr $addr accept comment \"nova-node\""
+            else echo "    ip daddr $addr accept comment \"nova-node\""; fi
+            [ -n "$ifc" ] && echo "    oifname \"$ifc\" accept comment \"node tunnel\""
+        fi
+        echo "    udp dport 53 drop comment \"force DNS to nova-node\""
+        echo "    tcp dport { 53, 853 } drop comment \"force DNS to nova-node\""
         echo "  }"
         echo "}"
     } > "$RUNTIME_RULESET"
+}
+
+node_apply() {
+    local kind addr ifc
+    read -r kind addr ifc < <(node_pick)
+    # prefer local: if the node is on the LAN, drop the split tunnel we started
+    if [ "$kind" = local ] && [ "$MANAGE_TUNNELS" = 1 ] && [ -n "$NODE_TUNNEL" ]; then
+        if [ -f "$STATE_UP" ] && grep -qx "$NODE_TUNNEL" "$STATE_UP" 2>/dev/null; then
+            nmcli connection down "$NODE_TUNNEL" >/dev/null 2>&1 || true
+            grep -vx "$NODE_TUNNEL" "$STATE_UP" > "$STATE_UP.tmp" 2>/dev/null && mv "$STATE_UP.tmp" "$STATE_UP"
+        fi
+    fi
+    [ "$kind" = vpn ] && { : >> "$STATE_UP"; grep -qx "$NODE_TUNNEL" "$STATE_UP" || echo "$NODE_TUNNEL" >> "$STATE_UP"; }
+    gen_node_ruleset "$addr" "$ifc"
+    nft -f "$RUNTIME_RULESET"
+    mkdir -p "$STATE_DIR"
+    { echo "MODE=node"; echo "NODE_PATH=$kind"; echo "NODE_ADDR=$addr"
+      echo "IFACES=\"$ifc\""; echo "PROFILE="; } > "$CURRENT_FILE"
+    log "node mode: path=$kind addr=${addr:-none} iface=${ifc:-direct}"
 }
 
 # =====================  VPN chain orchestration  ============================
@@ -356,9 +409,16 @@ chain_up() { # profile
             nmcli connection up "$conn" >/dev/null 2>&1 || { log "failed to bring up $conn"; break; }
             echo "$conn" >> "$STATE_UP"
         fi
-        iface="$(nm_ipiface "$conn")"
-        [ -n "$iface" ] && wait_iface "$iface" 15 || log "warning: $conn iface not up yet"
-        [ -n "$iface" ] && prev_iface="$iface"
+        # wait for the REAL tunnel iface (resolve_layer rejects the base NIC,
+        # which NM reports transiently while OpenVPN establishes tun0)
+        iface=""; local n=0
+        while [ "$n" -lt 20 ]; do
+            iface="$(resolve_layer "$conn" | cut -d'|' -f1)"
+            [ -n "$iface" ] && break
+            sleep 1; n=$((n+1))
+        done
+        if [ -n "$iface" ]; then prev_iface="$iface"
+        else log "warning: $conn tunnel iface never came up — chain may be incomplete"; fi
     done < "$pf"
 }
 
@@ -378,14 +438,13 @@ chain_down() {
 }
 
 apply_now() { # profile
+    # node mode (a.k.a. dns) has its own local-preferred / VPN-fallback logic
+    if [ "$MODE" = node ] || [ "$MODE" = dns ]; then node_apply; return; fi
+
     local ev profile trusted trusted_iface ifaces endpoints bypass
     ev="$(evaluate "$1")"
     IFS='|' read -r profile trusted trusted_iface ifaces endpoints bypass <<<"$ev"
-    if [ "$MODE" = dns ]; then
-        gen_dns_ruleset "$ifaces"
-    else
-        gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
-    fi
+    gen_ruleset "$ifaces" "$endpoints" "$bypass" "$trusted_iface"
     nft -f "$RUNTIME_RULESET"
     mkdir -p "$STATE_DIR"
     { echo "MODE=$MODE"; echo "PROFILE=$profile"; echo "TRUSTED=$trusted"
@@ -457,7 +516,7 @@ cmd_list_vpns() {
 # All writes go through root here so the GUI needs no direct access to /etc.
 # Keys are validated against a whitelist; values are stored verbatim but only
 # ever re-sourced as shell — so keep the allowed set boring (no code).
-CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS MANAGE_TUNNELS ALLOW_IN_PORTS MGMT_SUBNETS"
+CONFIG_KEYS="MODE DEFAULT_PROFILE ALLOW_LAN BYPASS_SUBNETS AUTO_BYPASS_VPN_SUBNET TRUSTED_GATEWAYS DNS_SERVERS MANAGE_TUNNELS ALLOW_IN_PORTS MGMT_SUBNETS NODE_LOCAL NODE_VPN NODE_TUNNEL"
 
 valid_key() { case " $CONFIG_KEYS " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 

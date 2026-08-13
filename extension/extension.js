@@ -23,14 +23,15 @@ function readTextFile(path) {
 }
 
 function parseCurrent(text) {
-    const out = {mode: 'full', profile: '', trusted: '', ifaces: ''};
+    const out = {mode: 'full', profile: '', trusted: '', ifaces: '', node_path: ''};
     if (!text)
         return out;
     for (const line of text.split('\n')) {
-        const m = line.match(/^(MODE|PROFILE|TRUSTED|IFACES)=(.*)$/);
+        const m = line.match(/^(MODE|PROFILE|TRUSTED|IFACES|NODE_PATH)=(.*)$/);
         if (!m)
             continue;
-        out[m[1].toLowerCase()] = m[2].trim().replace(/^"(.*)"$/, '$1');
+        const key = m[1].toLowerCase();
+        out[key] = m[2].trim().replace(/^"(.*)"$/, '$1');
     }
     return out;
 }
@@ -58,7 +59,7 @@ class KillSwitchToggle extends QuickSettings.QuickMenuToggle {
     _init() {
         super._init({
             title: _('Kill Switch'),
-            iconName: 'channel-insecure-symbolic',
+            iconName: 'changes-allow-symbolic',
             toggleMode: true,
         });
 
@@ -167,21 +168,29 @@ class KillSwitchToggle extends QuickSettings.QuickMenuToggle {
             item.setOrnament(item._novaProfile === (this._profile || profile)
                 ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
 
+        // padlock metaphor: open = off, closed = protected, warning = blocking
         if (!armed) {
-            this.iconName = 'channel-insecure-symbolic';
-            this.subtitle = _('Disarmed');
-        } else if (mode === 'dns') {
-            this.iconName = 'network-wired-symbolic';
-            this.subtitle = _('DNS protection');
+            this.iconName = 'changes-allow-symbolic';
+            this.subtitle = _('Off');
+        } else if (mode === 'node' || mode === 'dns') {
+            const path = parseCurrent(readTextFile(CURRENT_FILE)).node_path;
+            if (path === 'none') {
+                this.iconName = 'dialog-warning-symbolic';
+                this.subtitle = _('Node unreachable');
+            } else {
+                this.iconName = 'changes-prevent-symbolic';
+                this.subtitle = path === 'local' ? _('Node · local')
+                    : path === 'vpn' ? _('Node · VPN') : _('Node access');
+            }
         } else if (trusted) {
-            this.iconName = 'network-wireless-symbolic';
+            this.iconName = 'changes-prevent-symbolic';
             this.subtitle = _('Trusted gateway');
         } else if (ifaces) {
-            this.iconName = 'channel-secure-symbolic';
+            this.iconName = 'changes-prevent-symbolic';
             this.subtitle = _('Protected · %s').format(ifaces.split(' ').join('→'));
         } else {
             this.iconName = 'dialog-warning-symbolic';
-            this.subtitle = _('Blocking (no VPN)');
+            this.subtitle = _('Blocking — no VPN');
         }
     }
 
@@ -197,7 +206,7 @@ class KillSwitchIndicator extends QuickSettings.SystemIndicator {
     _init() {
         super._init();
         this._indicator = this._addIndicator();
-        this._indicator.icon_name = 'channel-insecure-symbolic';
+        this._indicator.icon_name = 'changes-allow-symbolic';
 
         this._toggle = new KillSwitchToggle();
         this._toggle.bind_property('checked', this._indicator, 'visible',

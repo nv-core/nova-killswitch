@@ -4,15 +4,20 @@
 # Protection mode:
 #   full = fail-closed WAN kill switch (block everything except the VPN
 #          chain / trusted gateway / bypass subnets)
-#   dns  = WAN stays open, but DNS (and DoT) is forced through the trusted
-#          resolver(s) / split tunnel below — a lightweight anti-DNS-leak
-#          mode for "use the nova-node only as DNS" setups.
+#   node = prefer the nova-node on the LAN; if it can't be reached there, bring
+#          up the split VPN below to reach it over the tunnel. WAN stays
+#          direct, you get full access to the node (local or VPN address), DNS
+#          is forced to the node, and blocked if the node is unreachable by any
+#          path. ("dns" is accepted as an alias.)
 MODE=full
 
-# dns mode: allowed resolver IPs (space-separated). e.g. the nova-node or the
-# DNS/split-tunnel's server, reachable via a profile tunnel:
-#   DNS_SERVERS="10.8.0.1"
-DNS_SERVERS=""
+# --- node mode ---
+# The nova-node's address on the LAN (preferred path). IP or subnet:
+NODE_LOCAL=""
+# The nova-node's address over the split VPN (used when NODE_LOCAL is down):
+NODE_VPN=""
+# The split VPN connection (NM name) that reaches the node when off-LAN:
+NODE_TUNNEL=""
 
 # Profile armed by default (name of a file in profiles/, without .profile).
 # In dns mode a profile can still bring up the split/DNS tunnel; only DNS is
