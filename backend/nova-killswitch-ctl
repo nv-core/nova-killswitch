@@ -282,6 +282,9 @@ cmd_config_set() { # key value...
         echo "$key=\"$value\"" >> "$CONFIG_FILE"
     fi
     log "config set $key"
+    # re-source so the immediate re-sync sees the new value (this process
+    # sourced the old config at startup) — the GUI expects instant apply
+    . "$CONFIG_FILE"
     armed && cmd_sync || true
 }
 
